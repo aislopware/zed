@@ -33,8 +33,6 @@ log.workspace = true
 metal.workspace = true
 objc.workspace = true
 parking_lot.workspace = true
-
-[target.'cfg(target_os = "macos")'.dependencies]
 core-foundation.workspace = true
 core-video.workspace = true
 
