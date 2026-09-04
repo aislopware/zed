@@ -190,11 +190,21 @@ fn register_metal_view_class() -> &'static AnyClass {
             handle_touches(this, touches, event);
         }
 
+        /// Target of the view's `UIPinchGestureRecognizer`.
+        extern "C" fn handle_pinch(this: *mut AnyObject, _sel: Sel, recognizer: *mut AnyObject) {
+            handle_pinch_gesture(this, recognizer);
+        }
+
         unsafe {
             // Add class method for layerClass
             decl.add_class_method(
                 sel!(layerClass),
                 layer_class as extern "C" fn(*const AnyClass, Sel) -> *const AnyClass,
+            );
+
+            decl.add_method(
+                sel!(handlePinch:),
+                handle_pinch as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
             );
 
             // Add touch handling instance methods
@@ -405,6 +415,48 @@ fn handle_touches(view: *mut AnyObject, touches: *mut AnyObject, event: *mut Any
     }
 }
 
+/// `UIGestureRecognizerState`.
+const UI_GESTURE_STATE_BEGAN: i64 = 1;
+const UI_GESTURE_STATE_CHANGED: i64 = 2;
+const UI_GESTURE_STATE_ENDED: i64 = 3;
+const UI_GESTURE_STATE_CANCELLED: i64 = 4;
+
+/// Handle a pinch from the GPUIMetalView's `UIPinchGestureRecognizer`.
+///
+/// UIKit owns the recognition (its `cancelsTouchesInView` default cancels the raw touches, so
+/// gpui core's portable pan/tap recognizers drop them); GPUI sees the same [`PinchEvent`]s a
+/// trackpad produces on macOS. The recognizer's scale is reset to 1 after every report so
+/// `delta` is the change since the previous event, as on macOS.
+fn handle_pinch_gesture(view: *mut AnyObject, recognizer: *mut AnyObject) {
+    unsafe {
+        #[allow(deprecated)]
+        let window_ptr: *mut std::ffi::c_void = *(*view).get_ivar(GPUI_WINDOW_IVAR);
+        if window_ptr.is_null() {
+            return;
+        }
+        let window = &*(window_ptr as *const IosWindow);
+
+        let state: i64 = msg_send![recognizer, state];
+        let phase = match state {
+            UI_GESTURE_STATE_BEGAN => TouchPhase::Started,
+            UI_GESTURE_STATE_CHANGED => TouchPhase::Moved,
+            UI_GESTURE_STATE_ENDED => TouchPhase::Ended,
+            UI_GESTURE_STATE_CANCELLED => TouchPhase::Cancelled,
+            _ => return,
+        };
+        let scale: core_graphics::base::CGFloat = msg_send![recognizer, scale];
+        let _: () = msg_send![recognizer, setScale: 1.0 as core_graphics::base::CGFloat];
+        let location: super::cg_types::ObjcCGPoint = msg_send![recognizer, locationInView: view];
+        let position = Point::new(px(location.x as f32), px(location.y as f32));
+        window.handle_pinch(gpui::PinchEvent {
+            position,
+            delta: scale as f32 - 1.0,
+            modifiers: Modifiers::default(),
+            phase,
+        });
+    }
+}
+
 #[allow(clippy::type_complexity)]
 pub(crate) struct IosWindow {
     /// The UIWindow object
@@ -501,6 +553,13 @@ impl IosWindow {
             // Enable user interaction on the Metal view for touch handling
             let _: () = msg_send![view, setUserInteractionEnabled: true];
             let _: () = msg_send![view, setMultipleTouchEnabled: true];
+
+            // Pinch to zoom, recognized by UIKit and delivered as `PinchEvent`s (see
+            // `handle_pinch_gesture`). The view is its own target.
+            let pinch: *mut AnyObject = msg_send![class!(UIPinchGestureRecognizer), alloc];
+            let pinch: *mut AnyObject =
+                msg_send![pinch, initWithTarget: view, action: sel!(handlePinch:)];
+            let _: () = msg_send![view, addGestureRecognizer: pinch];
 
             // Set the view as the view controller's view
             let _: () = msg_send![view_controller, setView: view];
@@ -667,6 +726,14 @@ impl IosWindow {
         };
         if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
             callback(PlatformInput::Touch(event));
+        }
+    }
+
+    /// Delivers a UIKit pinch as a GPUI pinch event.
+    pub fn handle_pinch(&self, event: gpui::PinchEvent) {
+        self.mouse_position.set(event.position);
+        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
+            callback(PlatformInput::Pinch(event));
         }
     }
 
