@@ -2655,6 +2655,12 @@ impl Window {
         self.appearance
     }
 
+    /// Regions of the window covered by system UI (safe area) or the soft keyboard.
+    /// Zero everywhere on desktop platforms.
+    pub fn insets(&self) -> crate::WindowInsets {
+        self.platform_window.insets()
+    }
+
     /// Returns the size of the drawable area within the window.
     pub fn viewport_size(&self) -> Size<Pixels> {
         self.viewport_size
