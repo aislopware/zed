@@ -154,6 +154,28 @@ fn register_metal_view_class() -> &'static AnyClass {
             class!(CAMetalLayer) as *const AnyClass
         }
 
+        // VoiceOver asks the view for its elements; the window's bridge answers (and turns
+        // GPUI's tree on the first time). The view itself is a container, not an element.
+        extern "C" fn accessibility_elements(this: *mut AnyObject, _sel: Sel) -> *mut AnyObject {
+            let window_ptr: *mut std::ffi::c_void = unsafe {
+                #[allow(deprecated)]
+                *(*this).get_ivar(GPUI_WINDOW_IVAR)
+            };
+            if window_ptr.is_null() {
+                return std::ptr::null_mut();
+            }
+            let window = unsafe { &*(window_ptr as *const IosWindow) };
+            let elements = window.a11y.borrow().as_ref().and_then(|bridge| bridge.elements());
+            elements.map_or(std::ptr::null_mut(), |array| {
+                // The array is retained by the bridge until the next update; UIKit copies it.
+                objc2::rc::Retained::as_ptr(&array).cast_mut().cast::<AnyObject>()
+            })
+        }
+
+        extern "C" fn is_accessibility_element(_this: *mut AnyObject, _sel: Sel) -> Bool {
+            Bool::NO
+        }
+
         // Touch handling methods
         extern "C" fn touches_began(
             this: *mut AnyObject,
@@ -271,6 +293,14 @@ fn register_metal_view_class() -> &'static AnyClass {
                 layer_class as extern "C" fn(*const AnyClass, Sel) -> *const AnyClass,
             );
 
+            decl.add_method(
+                sel!(accessibilityElements),
+                accessibility_elements as extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
+            );
+            decl.add_method(
+                sel!(isAccessibilityElement),
+                is_accessibility_element as extern "C" fn(*mut AnyObject, Sel) -> Bool,
+            );
             decl.add_method(
                 sel!(handlePinch:),
                 handle_pinch as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
@@ -743,6 +773,8 @@ pub(crate) struct IosWindow {
     /// The scroll recognizer's last reported translation, for per-event deltas.
     scroll_translation: Cell<Point<f32>>,
     renderer: Mutex<MetalRenderer>,
+    /// VoiceOver bridge, once GPUI hands over its accessibility callbacks.
+    a11y: RefCell<Option<super::a11y::A11yBridge>>,
 }
 
 // Required for raw_window_handle
@@ -880,6 +912,7 @@ impl IosWindow {
                 repeat_generation: Cell::new(0),
                 scroll_translation: Cell::new(Point::new(0.0, 0.0)),
                 renderer: Mutex::new(renderer),
+                a11y: RefCell::new(None),
             };
 
             Ok(ios_window)
@@ -1613,6 +1646,16 @@ impl PlatformWindow for IosWindow {
 
     fn insets(&self) -> WindowInsets {
         self.current_insets()
+    }
+
+    fn a11y_init(&self, callbacks: gpui::A11yCallbacks) {
+        *self.a11y.borrow_mut() = Some(super::a11y::A11yBridge::new(self.view, callbacks));
+    }
+
+    fn a11y_tree_update(&self, tree_update: accesskit::TreeUpdate) {
+        if let Some(bridge) = self.a11y.borrow().as_ref() {
+            bridge.update(&tree_update, self.scale_factor.get());
+        }
     }
 
     fn on_insets_changed(&self, callback: Box<dyn FnMut(WindowInsets)>) {
