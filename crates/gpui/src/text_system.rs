@@ -292,6 +292,31 @@ impl TextSystem {
         self.read_metrics(font_id, |metrics| metrics.descent(font_size))
     }
 
+    /// Returns the font's recommended additional space between lines (its "leading") in pixels.
+    pub fn line_gap(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.line_gap(font_size))
+    }
+
+    /// Returns the font's suggested underline position in pixels, relative to the baseline
+    /// (negative below it), as the font's `post` table states it.
+    pub fn underline_position(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.underline_position(font_size))
+    }
+
+    /// Returns the font's suggested underline thickness in pixels, as the font's `post`
+    /// table states it.
+    pub fn underline_thickness(&self, font_id: FontId, font_size: Pixels) -> Pixels {
+        self.read_metrics(font_id, |metrics| metrics.underline_thickness(font_size))
+    }
+
+    /// Returns every metric the platform text system reads from the font, in font units
+    /// (see [`FontMetrics`] for the per-size accessors). On macOS and iOS these come from
+    /// Core Text (`CTFontGetAscent`/`Descent`/`Leading`, `CTFontGetUnderlinePosition`/
+    /// `Thickness`, `CTFontGetCapHeight`/`XHeight`); a value the font's tables omit is zero.
+    pub fn font_metrics(&self, font_id: FontId) -> FontMetrics {
+        self.read_metrics(font_id, |metrics| *metrics)
+    }
+
     /// Get the recommended baseline offset for the given font and line height.
     pub fn baseline_offset(
         &self,

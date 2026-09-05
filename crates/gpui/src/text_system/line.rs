@@ -64,6 +64,16 @@ impl ShapedLine {
         self.layout.width
     }
 
+    /// The shaped glyph runs: font, glyph id and position of every glyph, at the font size the
+    /// line was shaped at.
+    ///
+    /// For a fixed-pitch font the glyph ids and the advances scale linearly with the size, so a
+    /// caller can paint the same shaping at another size through [`Window::paint_glyph`] and
+    /// [`Window::paint_emoji`] instead of shaping again.
+    pub fn layout(&self) -> &LineLayout {
+        &self.layout
+    }
+
     /// Override the len, useful if you're rendering text a
     /// as text b (e.g. rendering invisibles).
     pub fn with_len(mut self, len: usize) -> Self {
