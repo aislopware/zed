@@ -22,6 +22,7 @@ test-support = ["gpui/test-support", "gpui_apple/test-support"]
 gpui.workspace = true
 
 [target.'cfg(target_os = "ios")'.dependencies]
+accesskit.workspace = true
 anyhow.workspace = true
 block2.workspace = true
 core-foundation.workspace = true
@@ -35,6 +36,15 @@ image.workspace = true
 log.workspace = true
 metal.workspace = true
 objc2.workspace = true
+objc2-core-foundation = { version = "0.3", default-features = false, features = ["CFCGTypes"] }
+objc2-foundation.workspace = true
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
+    "UIAccessibility",
+    "UIAccessibilityConstants",
+    "UIAccessibilityElement",
+    "UIResponder",
+    "objc2-core-foundation",
+] }
 parking_lot.workspace = true
 pathfinder_geometry.workspace = true
 raw-window-handle.workspace = true
