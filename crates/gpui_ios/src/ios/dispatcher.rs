@@ -106,3 +106,17 @@ unsafe extern "C" fn trampoline(runnable: *mut c_void) {
     let task = unsafe { RunnableVariant::from_raw(NonNull::new_unchecked(runnable as *mut ())) };
     task.run();
 }
+
+/// Runs `f` on the main queue after `duration`.
+pub(crate) fn after_on_main(duration: Duration, f: Box<dyn FnOnce()>) {
+    let context = Box::into_raw(Box::new(f)) as *mut c_void;
+    unsafe {
+        let when = dispatch_time(DISPATCH_TIME_NOW, duration.as_nanos() as i64);
+        dispatch_after_f(when, dispatch_get_main_queue(), context, Some(boxed_trampoline));
+    }
+}
+
+unsafe extern "C" fn boxed_trampoline(context: *mut c_void) {
+    let f = unsafe { Box::from_raw(context as *mut Box<dyn FnOnce()>) };
+    f();
+}
