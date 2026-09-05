@@ -293,6 +293,19 @@ impl A11y {
     pub(crate) fn debug_tree_json(&self) -> Option<String> {
         self.debug.to_json()
     }
+
+    /// The tree update built for the last frame, if the tree was active then.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.debug.last_tree_update()
+    }
+
+    /// Turn the tree on (or off) from the next frame, as if assistive technology had
+    /// connected: the same flag the platform adapter's activation callback sets.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn force_active(&self, active: bool) {
+        self.active_flag.store(active, Ordering::SeqCst);
+    }
 }
 
 /// Builder API for synthetic children. See the docs for

@@ -6585,6 +6585,23 @@ impl Window {
         self.a11y.debug_tree_json()
     }
 
+    /// The accessibility tree built for the last frame: every node with its role, label,
+    /// value, bounds (device pixels) and actions, plus the focused node id. `None` until a
+    /// frame was drawn with the tree active (see [`Self::set_a11y_active`]). Children are
+    /// listed on each node in reading order; the flat `nodes` list is in pop order.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn a11y_tree(&self) -> Option<&accesskit::TreeUpdate> {
+        self.a11y.last_tree_update()
+    }
+
+    /// Build the accessibility tree from the next frame on, as if a screen reader had
+    /// connected, so tests can read it without one. Requests a redraw.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn set_a11y_active(&mut self, active: bool) {
+        self.a11y.force_active(active);
+        self.refresh();
+    }
+
     /// Register a listener for an accessibility action on a specific node.
     /// The listener will be called when a screen reader requests the given
     /// action on the node identified by `node_id`.

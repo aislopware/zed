@@ -5336,6 +5336,59 @@ mod tests {
         assert_eq!(focused, Some(item_b.id));
     }
 
+    struct LabelledButton;
+
+    impl Render for LabelledButton {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().id("root").role(accesskit::Role::Group).size_full().child(
+                div()
+                    .id("save")
+                    .role(accesskit::Role::Button)
+                    .aria_label("Save")
+                    .on_click(|_, _, _| {})
+                    .w(px(40.))
+                    .h(px(20.)),
+            )
+        }
+    }
+
+    /// `set_a11y_active` builds the tree without a screen reader, and `a11y_tree` reads the
+    /// last frame's nodes with their roles, labels, actions and bounds.
+    #[test]
+    fn a11y_tree_is_readable_once_forced_active() {
+        let mut cx = TestAppContext::single();
+        let window: AnyWindowHandle = cx.add_window(|_, _| LabelledButton).into();
+        cx.update_window(window, |_, window, cx| {
+            assert!(window.a11y_tree().is_none(), "no tree before activation");
+            window.set_a11y_active(true);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let (role, label, clickable, width, scale) = cx
+            .update_window(window, |_, window, _| {
+                let scale = window.scale_factor();
+                let tree = window.a11y_tree().expect("a tree after an active frame");
+                let (_, button) = tree
+                    .nodes
+                    .iter()
+                    .find(|(_, node)| node.role() == accesskit::Role::Button)
+                    .expect("the button node");
+                (
+                    button.role(),
+                    button.label().map(str::to_owned),
+                    button.supports_action(accesskit::Action::Click),
+                    button.bounds().map(|b| b.x1 - b.x0),
+                    scale,
+                )
+            })
+            .unwrap();
+        assert_eq!(role, accesskit::Role::Button);
+        assert_eq!(label.as_deref(), Some("Save"));
+        assert!(clickable);
+        // Bounds are device pixels.
+        assert_eq!(width, Some(f64::from(40. * scale)));
+    }
+
     #[gpui::test]
     fn test_fractional_padding_does_not_make_a_fitting_container_scrollable(
         cx: &mut TestAppContext,
