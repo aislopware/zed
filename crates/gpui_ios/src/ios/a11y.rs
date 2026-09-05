@@ -27,9 +27,8 @@ use objc2_ui_kit::{
     UIAccessibilityLayoutChangedNotification, UIAccessibilityPostNotification,
     UIAccessibilityTraitButton, UIAccessibilityTraitHeader, UIAccessibilityTraitImage,
     UIAccessibilityTraitKeyboardKey, UIAccessibilityTraitLink, UIAccessibilityTraitNone,
-    UIAccessibilityTraitNotEnabled, UIAccessibilityTraitSearchField,
-    UIAccessibilityTraitSelected, UIAccessibilityTraitStaticText,
-    UIAccessibilityTraitUpdatesFrequently, UIAccessibilityTraits,
+    UIAccessibilityTraitNotEnabled, UIAccessibilityTraitSearchField, UIAccessibilityTraitSelected,
+    UIAccessibilityTraitStaticText, UIAccessibilityTraitUpdatesFrequently, UIAccessibilityTraits,
 };
 use parking_lot::Mutex;
 
@@ -144,7 +143,10 @@ impl A11yBridge {
             let element = Element::new(
                 mtm,
                 container,
-                ElementIvars { node: id, action: Arc::clone(&self.action) },
+                ElementIvars {
+                    node: id,
+                    action: Arc::clone(&self.action),
+                },
             );
             element.setIsAccessibilityElement(true);
             let label = node.label().map(str::to_owned);
@@ -157,8 +159,14 @@ impl A11yBridge {
             }
             element.setAccessibilityTraits(traits);
             let frame = node.bounds().map(|r| CGRect {
-                origin: CGPoint { x: r.x0 / scale, y: r.y0 / scale },
-                size: CGSize { width: (r.x1 - r.x0) / scale, height: (r.y1 - r.y0) / scale },
+                origin: CGPoint {
+                    x: r.x0 / scale,
+                    y: r.y0 / scale,
+                },
+                size: CGSize {
+                    width: (r.x1 - r.x0) / scale,
+                    height: (r.y1 - r.y0) / scale,
+                },
             });
             if let Some(frame) = frame {
                 element.setAccessibilityFrameInContainerSpace(frame);
@@ -198,7 +206,9 @@ impl A11yBridge {
         // SAFETY: `UIAccessibilityLayoutChangedNotification` takes an element to move the
         // screen reader's focus to, or nil to re-read the screen in place; called on the main
         // thread with an element the view's array retains.
-        unsafe { UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, argument) };
+        unsafe {
+            UIAccessibilityPostNotification(UIAccessibilityLayoutChangedNotification, argument)
+        };
     }
 }
 

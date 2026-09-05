@@ -84,6 +84,23 @@ pub(crate) fn unregister_window(window: *const super::window::IosWindow) {
     }
 }
 
+/// The most recently opened window's [`IosWindow::inject`](super::window::IosWindow::inject).
+#[cfg(feature = "test-support")]
+pub(crate) fn inject(input: crate::described::DescribedInput) -> Result<(), crate::InjectError> {
+    let on_main: bool = unsafe { objc2::msg_send![objc2::class!(NSThread), isMainThread] };
+    if !on_main {
+        return Err(crate::InjectError::NotMainThread);
+    }
+    let window = unsafe { (*window_list().0.get()).last().copied() };
+    match window.and_then(|window| unsafe { window.as_ref() }) {
+        Some(window) => {
+            window.inject(input);
+            Ok(())
+        }
+        None => Err(crate::InjectError::NoWindow),
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_get_window() -> *mut c_void {
     unsafe {

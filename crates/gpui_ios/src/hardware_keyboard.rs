@@ -13,15 +13,15 @@
 use gpui::{Capslock, Keystroke, Modifiers};
 
 /// `UIKeyModifierFlags`.
-const ALPHA_SHIFT: u32 = 1 << 16;
-const SHIFT: u32 = 1 << 17;
-const CONTROL: u32 = 1 << 18;
-const ALTERNATE: u32 = 1 << 19;
-const COMMAND: u32 = 1 << 20;
+pub const ALPHA_SHIFT: u32 = 1 << 16;
+pub const SHIFT: u32 = 1 << 17;
+pub const CONTROL: u32 = 1 << 18;
+pub const ALTERNATE: u32 = 1 << 19;
+pub const COMMAND: u32 = 1 << 20;
 
 /// What UIKit tells us about one key press (`UIKey`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct UiKey {
+pub struct UiKey {
     /// `UIKey.keyCode`, a USB HID usage from the keyboard page.
     pub hid: u32,
     /// `UIKey.characters`: what the key types with every modifier applied.
@@ -33,12 +33,12 @@ pub(crate) struct UiKey {
 }
 
 /// The keyboard-page usages of the eight modifier keys (left/right ctrl, shift, alt, cmd).
-pub(crate) const fn is_modifier_key(hid: u32) -> bool {
+pub const fn is_modifier_key(hid: u32) -> bool {
     matches!(hid, 0xE0..=0xE7)
 }
 
 /// The modifier state a flag word describes.
-pub(crate) const fn modifiers(flags: u32) -> (Modifiers, Capslock) {
+pub const fn modifiers(flags: u32) -> (Modifiers, Capslock) {
     (
         Modifiers {
             control: flags & CONTROL != 0,
@@ -121,7 +121,7 @@ fn is_text(s: &str) -> bool {
 }
 
 /// The keystroke a press produces, or `None` for a modifier key or a key nothing maps.
-pub(crate) fn keystroke(key: &UiKey) -> Option<Keystroke> {
+pub fn keystroke(key: &UiKey) -> Option<Keystroke> {
     if is_modifier_key(key.hid) {
         return None;
     }
@@ -171,14 +171,15 @@ pub(crate) fn keystroke(key: &UiKey) -> Option<Keystroke> {
 
 /// Whether the text system should type this keystroke instead of us dispatching it: a
 /// character with no chord modifier, which `insertText:` delivers through the input handler.
-pub(crate) fn is_plain_text(keystroke: &Keystroke) -> bool {
+pub fn is_plain_text(keystroke: &Keystroke) -> bool {
     let m = &keystroke.modifiers;
     !m.control
         && !m.platform
         && !m.alt
-        && keystroke.key_char.as_deref().is_some_and(|c| {
-            !matches!(keystroke.key.as_str(), "enter" | "tab") && is_text(c)
-        })
+        && keystroke
+            .key_char
+            .as_deref()
+            .is_some_and(|c| !matches!(keystroke.key.as_str(), "enter" | "tab") && is_text(c))
 }
 
 #[cfg(test)]
@@ -224,7 +225,10 @@ mod tests {
         assert_eq!(up.key, "up");
         assert!(up.modifiers.platform);
         let enter = keystroke(&key(0x28, "\r", "\r", 0)).unwrap();
-        assert_eq!((enter.key.as_str(), enter.key_char.as_deref()), ("enter", Some("\n")));
+        assert_eq!(
+            (enter.key.as_str(), enter.key_char.as_deref()),
+            ("enter", Some("\n"))
+        );
         assert!(!is_plain_text(&enter));
         assert!(keystroke(&key(0xE0, "", "", CONTROL)).is_none());
         assert!(is_plain_text(&keystroke(&key(0x04, "a", "a", 0)).unwrap()));
