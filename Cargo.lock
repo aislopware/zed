@@ -7589,6 +7589,7 @@ dependencies = [
  "futures 0.3.32",
  "gpui",
  "gpui_apple",
+ "image",
  "log",
  "metal",
  "objc2 0.6.3",

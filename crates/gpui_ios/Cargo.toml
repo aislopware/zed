@@ -15,6 +15,8 @@ crate-type = ["staticlib", "rlib"]
 [features]
 default = []
 runtime_shaders = ["gpui_apple/runtime_shaders"]
+# `PlatformWindow::render_to_image` (offscreen Metal render of the current scene) for tests.
+test-support = ["gpui/test-support", "gpui_apple/test-support"]
 
 [dependencies]
 gpui.workspace = true
@@ -29,6 +31,7 @@ core-text.workspace = true
 font-kit = { git = "https://github.com/zed-industries/font-kit", rev = "94b0f28166665e8fd2f53ff6d268a14955c82269", package = "zed-font-kit", version = "0.14.1-zed" }
 futures.workspace = true
 gpui_apple.workspace = true
+image.workspace = true
 log.workspace = true
 metal.workspace = true
 objc2.workspace = true
