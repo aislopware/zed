@@ -4524,6 +4524,84 @@ impl Window {
         Ok(())
     }
 
+    /// Paints a monochrome glyph rasterized at `raster_size` and drawn at `font_size`: the
+    /// atlas tile is stretched by `font_size / raster_size`. For text in motion (a zoom
+    /// gesture), where a fresh raster for every intermediate size costs a frame and is never
+    /// seen for more than one, a caller can rasterize at a few fixed sizes and scale between
+    /// them. The scaled tile is grayscale-antialiased; subpixel rendering does not survive
+    /// resampling. With `raster_size == font_size` this is [`Self::paint_glyph`] without
+    /// subpixel rendering.
+    ///
+    /// The y component of the origin is the baseline of the glyph.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_glyph_scaled(
+        &mut self,
+        origin: Point<Pixels>,
+        font_id: FontId,
+        glyph_id: GlyphId,
+        raster_size: Pixels,
+        font_size: Pixels,
+        color: Hsla,
+    ) -> Result<()> {
+        self.invalidator.debug_assert_paint();
+
+        let element_opacity = self.element_opacity();
+        let scale_factor = self.scale_factor();
+        let glyph_origin = origin.scale(scale_factor);
+        let scale = if raster_size.0 > 0.0 { font_size.0 / raster_size.0 } else { 1.0 };
+
+        let quantized_origin = Point::new(
+            round_half_toward_zero(glyph_origin.x.0 * SUBPIXEL_VARIANTS_X as f32)
+                / SUBPIXEL_VARIANTS_X as f32,
+            round_half_toward_zero(glyph_origin.y.0 * SUBPIXEL_VARIANTS_Y as f32)
+                / SUBPIXEL_VARIANTS_Y as f32,
+        );
+        let subpixel_variant = Point::new(
+            (quantized_origin.x.fract() * SUBPIXEL_VARIANTS_X as f32) as u8,
+            (quantized_origin.y.fract() * SUBPIXEL_VARIANTS_Y as f32) as u8,
+        );
+        let integer_origin = quantized_origin.map(|c| ScaledPixels(c.trunc()));
+        let dilation = self.text_system().glyph_dilation_for_color(color);
+        let params = RenderGlyphParams {
+            font_id,
+            glyph_id,
+            font_size: raster_size,
+            subpixel_variant,
+            scale_factor,
+            is_emoji: false,
+            subpixel_rendering: false,
+            dilation,
+        };
+
+        let raster_bounds = self.text_system().raster_bounds(&params)?;
+        if !raster_bounds.is_zero() {
+            let tile = self
+                .sprite_atlas
+                .get_or_insert_with(&params.clone().into(), &mut || {
+                    let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
+                    Ok(Some((size, Cow::Owned(bytes))))
+                })?
+                .expect("Callback above only errors or returns Some");
+            let stretch = |px: DevicePixels| ScaledPixels(px.0 as f32 * scale);
+            let bounds = Bounds {
+                origin: integer_origin + raster_bounds.origin.map(stretch),
+                size: tile.bounds.size.map(stretch),
+            };
+            let content_mask = self.snapped_content_mask();
+            self.next_frame.scene.insert_primitive(MonochromeSprite {
+                order: 0,
+                pad: 0,
+                bounds,
+                content_mask,
+                color: color.opacity(element_opacity),
+                tile,
+                transformation: TransformationMatrix::unit(),
+            });
+        }
+        Ok(())
+    }
+
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
