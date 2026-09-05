@@ -1275,9 +1275,17 @@ impl IosWindow {
         ));
     }
 
+    /// Hands an event to GPUI. The callback is taken out of its cell for the call, so a
+    /// dispatch that re-enters (GPUI asking the platform for another event on the way) finds
+    /// no borrow to trip over; one registered meanwhile wins over the one taken out.
     fn dispatch_input(&self, event: PlatformInput) {
-        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-            callback(event);
+        let taken = self.input_callback.borrow_mut().take();
+        if let Some(mut callback) = taken {
+            let _result = callback(event);
+            let mut slot = self.input_callback.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(callback);
+            }
         }
     }
 
@@ -1328,9 +1336,19 @@ impl IosWindow {
 
     /// Delivers typed text: to the focused input handler when there is one (the app's text
     /// field, IME text intact), else as one `KeyDown` per character.
+    ///
+    /// The handler is taken out of its cell for the call and put back after, as the Mac
+    /// backend does: the call re-enters GPUI, which may draw and swap the handler through
+    /// `take_input_handler` / `set_input_handler` on the way, and a borrow held across it
+    /// would panic. A handler GPUI installed meanwhile wins over the one taken out.
     pub(crate) fn insert_text(&self, text: &str) {
-        if let Some(handler) = self.input_handler.borrow_mut().as_mut() {
+        let taken = self.input_handler.borrow_mut().take();
+        if let Some(mut handler) = taken {
             handler.replace_text_in_range(None, text);
+            let mut slot = self.input_handler.borrow_mut();
+            if slot.is_none() {
+                *slot = Some(handler);
+            }
             return;
         }
         for character in text.chars() {
@@ -1369,10 +1387,7 @@ impl IosWindow {
         } else {
             key_code_to_key_up(key_code, modifier_flags)
         };
-
-        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-            callback(event);
-        }
+        self.dispatch_input(event);
     }
 
     /// Notify the window of active status changes (foreground/background).
