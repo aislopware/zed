@@ -213,7 +213,9 @@ pub fn us_key(usage: u32, flags: u32) -> UiKey {
     let (ignoring, characters) = match us_pair(usage) {
         Some((plain, shifted)) => {
             let letter = plain.is_ascii_lowercase();
-            let ignoring = if shift || (caps && letter) {
+            // Caps Lock reverses the case of letters only, so with Shift held it reverses
+            // Shift: `A` under either alone, `a` under both, as a US keyboard reports.
+            let ignoring = if shift ^ (caps && letter) {
                 shifted
             } else {
                 plain
@@ -314,6 +316,14 @@ mod tests {
         assert_eq!(caps_l.characters, "L", "caps lock shifts letters");
         let caps_1 = us_key(0x1E, ALPHA_SHIFT);
         assert_eq!(caps_1.characters, "1", "but not digits");
+        let caps_shift_l = us_key(0x0F, ALPHA_SHIFT | SHIFT);
+        assert_eq!(
+            caps_shift_l.characters, "l",
+            "caps lock and shift reverse each other"
+        );
+        assert_eq!(caps_shift_l.characters_ignoring_modifiers, "l");
+        let caps_shift_1 = us_key(0x1E, ALPHA_SHIFT | SHIFT);
+        assert_eq!(caps_shift_1.characters, "!", "on letters only");
         let bang = us_key(0x1E, SHIFT);
         assert_eq!(
             (
