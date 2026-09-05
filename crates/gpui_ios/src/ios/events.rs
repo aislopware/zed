@@ -1,46 +1,11 @@
 //! Conversion from UIKit events to GPUI input events.
 
-use gpui::{Pixels, Point, TouchId, TouchPhase, px};
+use gpui::{Pixels, Point, TouchId, px};
 use objc2::msg_send;
 use objc2::runtime::AnyObject;
 
 use super::cg_types::ObjcCGPoint;
-
-/// Touch phase from UIKit
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i64)]
-pub enum UITouchPhase {
-    Began = 0,
-    Moved = 1,
-    Stationary = 2,
-    Ended = 3,
-    Cancelled = 4,
-}
-
-impl From<i64> for UITouchPhase {
-    fn from(value: i64) -> Self {
-        match value {
-            0 => UITouchPhase::Began,
-            1 => UITouchPhase::Moved,
-            2 => UITouchPhase::Stationary,
-            3 => UITouchPhase::Ended,
-            4 => UITouchPhase::Cancelled,
-            _ => UITouchPhase::Cancelled,
-        }
-    }
-}
-
-impl From<UITouchPhase> for TouchPhase {
-    fn from(phase: UITouchPhase) -> Self {
-        match phase {
-            UITouchPhase::Began => TouchPhase::Started,
-            UITouchPhase::Moved => TouchPhase::Moved,
-            UITouchPhase::Stationary => TouchPhase::Moved,
-            UITouchPhase::Ended => TouchPhase::Ended,
-            UITouchPhase::Cancelled => TouchPhase::Cancelled,
-        }
-    }
-}
+use crate::described::UiTouchPhase;
 
 /// Returns the touch position in window coordinates.
 pub fn touch_location_in_view(touch: *mut AnyObject, view: *mut AnyObject) -> Point<Pixels> {
@@ -51,10 +16,10 @@ pub fn touch_location_in_view(touch: *mut AnyObject, view: *mut AnyObject) -> Po
 }
 
 /// Returns the current UIKit touch phase.
-pub fn touch_phase(touch: *mut AnyObject) -> UITouchPhase {
+pub fn touch_phase(touch: *mut AnyObject) -> UiTouchPhase {
     unsafe {
         let phase: i64 = msg_send![touch, phase];
-        UITouchPhase::from(phase)
+        UiTouchPhase::from_raw(phase)
     }
 }
 

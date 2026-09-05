@@ -11,14 +11,17 @@
 
 use super::IosDisplay;
 use super::events::*;
-use super::hardware_keyboard::{self, UiKey};
+#[cfg(feature = "test-support")]
+use crate::described::DescribedInput;
+use crate::described::{DescribedPinch, GestureState, PressPhase, UiTouchPhase};
+use crate::hardware_keyboard::{self, UiKey};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, DevicePixels, DispatchEventResult, Edges, GpuSpecs,
-    Keystroke, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, Scene, Size,
-    TextInputStateChange, TouchEvent, TouchPhase, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds,
-    WindowControlArea, WindowInsets, WindowParams, px, size,
+    Keystroke, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    Scene, Size, TextInputStateChange, TouchEvent, TouchId, TouchPhase, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams, px,
+    size,
 };
 use gpui_apple::metal_renderer::{Context as MetalContext, MetalRenderer};
 use objc2::encode::{Encode, Encoding, RefEncode};
@@ -279,7 +282,7 @@ fn register_metal_view_class() -> &'static AnyClass {
             presses: *mut AnyObject,
             event: *mut AnyObject,
         ) {
-            if !handle_presses(this, presses, PressPhase::Ended) {
+            if !handle_presses(this, presses, PressPhase::Cancelled) {
                 unsafe {
                     let _: () = msg_send![super(this, class!(UIView)), pressesCancelled: presses, withEvent: event];
                 }
@@ -543,13 +546,6 @@ fn handle_touches(view: *mut AnyObject, touches: *mut AnyObject, event: *mut Any
     }
 }
 
-/// Which end of a hardware key press UIKit reported.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum PressPhase {
-    Began,
-    Ended,
-}
-
 /// Initial delay and rate of the window's own key repeat (UIKit does not repeat presses).
 const KEY_REPEAT_DELAY: std::time::Duration = std::time::Duration::from_millis(400);
 const KEY_REPEAT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
@@ -571,6 +567,9 @@ unsafe fn string_of(ns: *mut AnyObject) -> String {
 /// Hardware key presses on the metal view (directly, or forwarded from the text input view
 /// as its next responder). Returns whether every press was consumed; when it is not, the
 /// caller forwards the set to `super` so UIKit's text system types the plain characters.
+///
+/// This is the UIKit boundary for keys: everything read out of the `UIPress` is in the
+/// [`UiKey`] handed to [`IosWindow::handle_hardware_key`], which a described press enters too.
 fn handle_presses(view: *mut AnyObject, presses: *mut AnyObject, phase: PressPhase) -> bool {
     unsafe {
         #[allow(deprecated)]
@@ -608,18 +607,13 @@ fn handle_presses(view: *mut AnyObject, presses: *mut AnyObject, phase: PressPha
     }
 }
 
-/// `UIGestureRecognizerState`.
-const UI_GESTURE_STATE_BEGAN: i64 = 1;
-const UI_GESTURE_STATE_CHANGED: i64 = 2;
-const UI_GESTURE_STATE_ENDED: i64 = 3;
-const UI_GESTURE_STATE_CANCELLED: i64 = 4;
-
 /// Handle a pinch from the GPUIMetalView's `UIPinchGestureRecognizer`.
 ///
 /// UIKit owns the recognition (its `cancelsTouchesInView` default cancels the raw touches, so
 /// gpui core's portable pan/tap recognizers drop them); GPUI sees the same [`PinchEvent`]s a
 /// trackpad produces on macOS. The recognizer's scale is reset to 1 after every report so
-/// `delta` is the change since the previous event, as on macOS.
+/// `delta` is the change since the previous event, as on macOS. The boundary: what is read
+/// off the recognizer is a [`DescribedPinch`], delivered by [`IosWindow::deliver_pinch`].
 fn handle_pinch_gesture(view: *mut AnyObject, recognizer: *mut AnyObject) {
     unsafe {
         #[allow(deprecated)]
@@ -630,22 +624,17 @@ fn handle_pinch_gesture(view: *mut AnyObject, recognizer: *mut AnyObject) {
         let window = &*(window_ptr as *const IosWindow);
 
         let state: i64 = msg_send![recognizer, state];
-        let phase = match state {
-            UI_GESTURE_STATE_BEGAN => TouchPhase::Started,
-            UI_GESTURE_STATE_CHANGED => TouchPhase::Moved,
-            UI_GESTURE_STATE_ENDED => TouchPhase::Ended,
-            UI_GESTURE_STATE_CANCELLED => TouchPhase::Cancelled,
-            _ => return,
+        let Some(state) = GestureState::from_raw(state) else {
+            return;
         };
         let scale: core_graphics::base::CGFloat = msg_send![recognizer, scale];
         let _: () = msg_send![recognizer, setScale: 1.0 as core_graphics::base::CGFloat];
         let location: super::cg_types::ObjcCGPoint = msg_send![recognizer, locationInView: view];
-        let position = Point::new(px(location.x as f32), px(location.y as f32));
-        window.handle_pinch(gpui::PinchEvent {
-            position,
-            delta: scale as f32 - 1.0,
-            modifiers: Modifiers::default(),
-            phase,
+        window.deliver_pinch(DescribedPinch {
+            state,
+            scale: scale as f32,
+            x: location.x as f32,
+            y: location.y as f32,
         });
     }
 }
@@ -655,13 +644,10 @@ const UI_SCROLL_TYPE_MASK_ALL: usize = 3;
 
 /// The `TouchPhase` of a gesture recognizer's state, `None` for possible/failed.
 const fn gesture_phase(state: i64) -> Option<TouchPhase> {
-    Some(match state {
-        UI_GESTURE_STATE_BEGAN => TouchPhase::Started,
-        UI_GESTURE_STATE_CHANGED => TouchPhase::Moved,
-        UI_GESTURE_STATE_ENDED => TouchPhase::Ended,
-        UI_GESTURE_STATE_CANCELLED => TouchPhase::Cancelled,
-        _ => return None,
-    })
+    match GestureState::from_raw(state) {
+        Some(state) => Some(state.phase()),
+        None => None,
+    }
 }
 
 /// A pointer hovering over the view: GPUI gets `MouseMove` with no button, as on the Mac.
@@ -674,7 +660,10 @@ fn handle_hover_gesture(view: *mut AnyObject, recognizer: *mut AnyObject) {
         }
         let window = &*(window_ptr as *const IosWindow);
         let state: i64 = msg_send![recognizer, state];
-        if !matches!(gesture_phase(state), Some(TouchPhase::Started | TouchPhase::Moved)) {
+        if !matches!(
+            gesture_phase(state),
+            Some(TouchPhase::Started | TouchPhase::Moved)
+        ) {
             return;
         }
         let location: super::cg_types::ObjcCGPoint = msg_send![recognizer, locationInView: view];
@@ -711,7 +700,10 @@ fn handle_scroll_gesture(view: *mut AnyObject, recognizer: *mut AnyObject) {
             window.scroll_translation.get()
         };
         window.scroll_translation.set(translation);
-        let delta = Point::new(px(translation.x - previous.x), px(translation.y - previous.y));
+        let delta = Point::new(
+            px(translation.x - previous.x),
+            px(translation.y - previous.y),
+        );
         let location: super::cg_types::ObjcCGPoint = msg_send![recognizer, locationInView: view];
         let position = Point::new(px(location.x as f32), px(location.y as f32));
         window.dispatch_input(PlatformInput::ScrollWheel(gpui::ScrollWheelEvent {
@@ -1004,34 +996,92 @@ impl IosWindow {
         });
     }
 
-    /// Delivers a UIKit touch through GPUI's platform-neutral touch API.
+    /// A `UITouch` from one of the view's `touches…:withEvent:` callbacks: the boundary for
+    /// touches. Everything read off the object (its address as the id, phase, location, the
+    /// event's prediction while it moves, force) goes to [`Self::deliver_touch`].
     pub fn handle_touch(&self, touch: *mut AnyObject, event: *mut AnyObject) {
         let position = touch_location_in_view(touch, self.view);
-        self.mouse_position.set(position);
-
-        let phase = touch_phase(touch).into();
-        let predicted_position = if phase == TouchPhase::Moved {
+        let phase = touch_phase(touch);
+        let predicted_position = if phase == UiTouchPhase::Moved {
             predicted_touch_location(touch, event, self.view)
         } else {
             None
         };
-        let event = TouchEvent {
-            id: touch_id(touch),
+        self.deliver_touch(
+            touch_id(touch),
             phase,
             position,
             predicted_position,
-            force: touch_force(touch),
-        };
-        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-            callback(PlatformInput::Touch(event));
-        }
+            touch_force(touch),
+        );
     }
 
-    /// Delivers a UIKit pinch as a GPUI pinch event.
-    pub fn handle_pinch(&self, event: gpui::PinchEvent) {
-        self.mouse_position.set(event.position);
-        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-            callback(PlatformInput::Pinch(event));
+    /// Delivers one touch through GPUI's platform-neutral touch API (gpui core's recognizer
+    /// turns it into taps, pans, long presses and drags).
+    pub(crate) fn deliver_touch(
+        &self,
+        id: TouchId,
+        phase: UiTouchPhase,
+        position: Point<Pixels>,
+        predicted_position: Option<Point<Pixels>>,
+        force: Option<f32>,
+    ) {
+        self.mouse_position.set(position);
+        let event = TouchEvent {
+            id,
+            phase: phase.into(),
+            position,
+            predicted_position,
+            force,
+        };
+        self.dispatch_input(PlatformInput::Touch(event));
+    }
+
+    /// Delivers one report of the pinch recognizer as a GPUI pinch event: `scale - 1` is the
+    /// incremental `delta`, as the Mac trackpad's.
+    pub(crate) fn deliver_pinch(&self, pinch: DescribedPinch) {
+        let position = Point::new(px(pinch.x), px(pinch.y));
+        self.mouse_position.set(position);
+        self.dispatch_input(PlatformInput::Pinch(gpui::PinchEvent {
+            position,
+            delta: pinch.scale - 1.0,
+            modifiers: Modifiers::default(),
+            phase: pinch.state.phase(),
+        }));
+    }
+
+    /// Runs a described input through the same delivery the UIKit callbacks use once they
+    /// have unpacked their objects (see `crate::described`). Test builds only: the self-test
+    /// socket of an app proves the phone's input path with it.
+    ///
+    /// A press the view would hand back to UIKit (plain text while a text input is first
+    /// responder) is typed the way the text system would, through `insertText:`, so the
+    /// described press ends where the real one does.
+    #[cfg(feature = "test-support")]
+    pub(crate) fn inject(&self, input: DescribedInput) {
+        match input {
+            DescribedInput::Press(press) => {
+                let key = crate::described::us_key(press.usage, press.flags);
+                let characters = key.characters.clone();
+                let consumed = self.handle_hardware_key(key, press.phase);
+                if !consumed && press.phase == PressPhase::Began && !characters.is_empty() {
+                    self.insert_text(&characters);
+                }
+            }
+            DescribedInput::Touches(touches) => {
+                for touch in touches {
+                    self.deliver_touch(
+                        TouchId(touch.id),
+                        touch.phase,
+                        Point::new(px(touch.x), px(touch.y)),
+                        None,
+                        None,
+                    );
+                }
+            }
+            DescribedInput::Pinch(pinch) => self.deliver_pinch(pinch),
+            DescribedInput::InsertText(text) => self.insert_text(&text),
+            DescribedInput::DeleteBackward => self.handle_delete_backward(),
         }
     }
 
@@ -1184,7 +1234,8 @@ impl IosWindow {
         };
         let editing: bool = unsafe { msg_send![self.text_input_view, isFirstResponder] };
         let typed_by_text_system = editing && hardware_keyboard::is_plain_text(&keystroke);
-        self.repeat_generation.set(self.repeat_generation.get().wrapping_add(1));
+        self.repeat_generation
+            .set(self.repeat_generation.get().wrapping_add(1));
         match phase {
             PressPhase::Began => {
                 if typed_by_text_system {
@@ -1199,7 +1250,7 @@ impl IosWindow {
                     prefer_character_input: false,
                 }));
             }
-            PressPhase::Ended => {
+            PressPhase::Ended | PressPhase::Cancelled => {
                 self.held_key.replace(None);
                 if typed_by_text_system {
                     return false;
@@ -1216,10 +1267,12 @@ impl IosWindow {
         }
         self.modifiers.set(modifiers);
         self.capslock.set(capslock);
-        self.dispatch_input(PlatformInput::ModifiersChanged(gpui::ModifiersChangedEvent {
-            modifiers,
-            capslock,
-        }));
+        self.dispatch_input(PlatformInput::ModifiersChanged(
+            gpui::ModifiersChangedEvent {
+                modifiers,
+                capslock,
+            },
+        ));
     }
 
     fn dispatch_input(&self, event: PlatformInput) {
@@ -1264,60 +1317,48 @@ impl IosWindow {
         self.schedule_repeat(KEY_REPEAT_INTERVAL);
     }
 
+    /// `insertText:` from the text system on the text input view: the boundary for typed
+    /// text. The `NSString` is read once and handed to [`Self::insert_text`].
     pub fn handle_text_input(&self, text: *mut AnyObject) {
-        if text.is_null() {
-            return;
-        }
-
-        unsafe {
-            let utf8: *const i8 = msg_send![text, UTF8String];
-            if utf8.is_null() {
-                return;
-            }
-
-            let text_str = std::ffi::CStr::from_ptr(utf8)
-                .to_string_lossy()
-                .into_owned();
-
-            if let Some(handler) = self.input_handler.borrow_mut().as_mut() {
-                handler.replace_text_in_range(None, &text_str);
-                return;
-            }
-
-            for character in text_str.chars() {
-                let keystroke = gpui::Keystroke {
-                    modifiers: Modifiers::default(),
-                    key: character.to_string(),
-                    key_char: Some(character.to_string()),
-                };
-
-                let event = PlatformInput::KeyDown(gpui::KeyDownEvent {
-                    keystroke,
-                    is_held: false,
-                    prefer_character_input: true,
-                });
-
-                if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-                    callback(event);
-                }
-            }
+        let text = unsafe { string_of(text) };
+        if !text.is_empty() {
+            self.insert_text(&text);
         }
     }
 
+    /// Delivers typed text: to the focused input handler when there is one (the app's text
+    /// field, IME text intact), else as one `KeyDown` per character.
+    pub(crate) fn insert_text(&self, text: &str) {
+        if let Some(handler) = self.input_handler.borrow_mut().as_mut() {
+            handler.replace_text_in_range(None, text);
+            return;
+        }
+        for character in text.chars() {
+            let keystroke = gpui::Keystroke {
+                modifiers: Modifiers::default(),
+                key: character.to_string(),
+                key_char: Some(character.to_string()),
+            };
+            self.dispatch_input(PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke,
+                is_held: false,
+                prefer_character_input: true,
+            }));
+        }
+    }
+
+    /// `deleteBackward` from the text system: a backspace `KeyDown`.
     pub fn handle_delete_backward(&self) {
         let keystroke = gpui::Keystroke {
             modifiers: Modifiers::default(),
             key: "backspace".to_string(),
             key_char: None,
         };
-        let event = PlatformInput::KeyDown(gpui::KeyDownEvent {
+        self.dispatch_input(PlatformInput::KeyDown(gpui::KeyDownEvent {
             keystroke,
             is_held: false,
             prefer_character_input: false,
-        });
-        if let Some(callback) = self.input_callback.borrow_mut().as_mut() {
-            callback(event);
-        }
+        }));
     }
 
     pub fn handle_key_event(&self, key_code: u32, modifier_flags: u32, is_key_down: bool) {
