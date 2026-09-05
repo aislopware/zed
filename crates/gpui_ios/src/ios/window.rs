@@ -1577,6 +1577,24 @@ impl PlatformWindow for IosWindow {
         self.renderer.lock().draw(scene);
     }
 
+    /// Draws `scene` into an offscreen texture the size of the layer's drawable and reads it
+    /// back. Offscreen rather than through `CAMetalLayer.nextDrawable`: the layer's drawables
+    /// belong to the display link, and a backgrounded simulator app may have none to give,
+    /// while a private render target is always available and never disturbs presentation.
+    #[cfg(any(test, feature = "test-support"))]
+    fn render_to_image(&self, scene: &Scene) -> anyhow::Result<image::RgbaImage> {
+        let mut renderer = self.renderer.lock();
+        let drawable = renderer
+            .layer()
+            .ok_or_else(|| anyhow::anyhow!("render_to_image needs a layer-backed renderer"))?
+            .drawable_size();
+        let viewport = size(
+            DevicePixels(drawable.width.ceil() as i32),
+            DevicePixels(drawable.height.ceil() as i32),
+        );
+        renderer.render_scene_to_image(scene, viewport)
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.renderer.lock().sprite_atlas().clone()
     }
