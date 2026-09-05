@@ -68,6 +68,12 @@ pub(crate) struct A11yDebug {
 }
 
 impl A11yDebug {
+    /// The last tree update captured, for tests that read the tree directly.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn last_tree_update(&self) -> Option<&TreeUpdate> {
+        self.last_tree_update.as_ref()
+    }
+
     pub(crate) fn capture(
         &mut self,
         update: &TreeUpdate,

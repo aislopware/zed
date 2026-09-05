@@ -7586,19 +7586,23 @@ dependencies = [
 name = "gpui_ios"
 version = "0.1.0"
 dependencies = [
+ "accesskit",
  "anyhow",
  "block2 0.6.2",
  "core-foundation 0.10.0",
  "core-foundation-sys",
  "core-graphics 0.24.0",
  "core-text",
- "futures 0.3.32",
+ "futures 0.3.34",
  "gpui",
  "gpui_apple",
  "image",
  "log",
  "metal",
  "objc2 0.6.3",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "objc2-ui-kit",
  "parking_lot",
  "pathfinder_geometry",
  "raw-window-handle",
@@ -12088,6 +12092,18 @@ dependencies = [
  "block2 0.6.2",
  "objc2 0.6.3",
  "objc2-core-graphics",
+ "objc2-foundation 0.3.2",
+]
+
+[[package]]
+name = "objc2-ui-kit"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d87d638e33c06f577498cbcc50491496a3ed4246998a7fbba7ccb98b1e7eab22"
+dependencies = [
+ "bitflags 2.13.1",
+ "objc2 0.6.3",
+ "objc2-core-foundation",
  "objc2-foundation 0.3.2",
 ]
 
