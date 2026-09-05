@@ -4,6 +4,7 @@ pub(crate) mod cg_types;
 mod dispatcher;
 mod display;
 mod events;
+mod hardware_keyboard;
 pub mod ffi;
 mod platform;
 mod text_input;
