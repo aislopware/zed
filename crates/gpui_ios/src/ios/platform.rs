@@ -19,11 +19,11 @@ use core_foundation::{
 };
 use futures::channel::oneshot;
 use gpui::{
-    Action, ActivityGuard, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardItem,
-    CursorStyle, DummyKeyboardMapper, ForegroundExecutor, Keymap, Menu, MenuItem,
-    PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper,
-    PlatformTextSystem, PlatformWindow, Result, Task, ThermalState, WindowAppearance,
-    WindowParams,
+    Action, ActivityGuard, AnyWindowHandle, AppLifecyclePhase, BackgroundExecutor, ClipboardEntry,
+    ClipboardItem, CursorStyle, DummyKeyboardMapper, ForegroundExecutor, Image, ImageFormat,
+    Keymap, Menu, MenuItem, PathPromptOptions, Platform, PlatformDisplay, PlatformKeyboardLayout,
+    PlatformKeyboardMapper, PlatformTextSystem, PlatformWindow, Result, Task, ThermalState,
+    WindowAppearance, WindowParams,
 };
 use objc2::runtime::{AnyObject, Bool};
 use objc2::{class, msg_send};
@@ -438,12 +438,50 @@ impl Platform for IosPlatform {
                 let ns_string = super::util::nsstring(&text);
                 let _: () = msg_send![pasteboard, setString: ns_string];
             }
+            // A picture goes on as its encoded bytes under the format's uniform type, the
+            // way a screenshot or a photo app puts one there; `image` reads it back the same.
+            for entry in item.entries() {
+                if let ClipboardEntry::Image(image) = entry
+                    && let Some(uti) = pasteboard_type(image.format)
+                {
+                    let data: *mut AnyObject = msg_send![
+                        class!(NSData),
+                        dataWithBytes: image.bytes.as_ptr() as *const std::ffi::c_void,
+                        length: image.bytes.len()
+                    ];
+                    let uti = super::util::nsstring(uti);
+                    let _: () = msg_send![pasteboard, setData: data, forPasteboardType: uti];
+                }
+            }
         }
     }
 
     fn read_from_clipboard(&self) -> Option<ClipboardItem> {
         unsafe {
             let pasteboard: *mut AnyObject = msg_send![class!(UIPasteboard), generalPasteboard];
+            // A picture first, in the order most likely on a phone (a screenshot is a PNG),
+            // as the macOS pasteboard does; then text.
+            let has_images: Bool = msg_send![pasteboard, hasImages];
+            if has_images.as_bool() {
+                for format in PASTED_FORMATS {
+                    let Some(uti) = pasteboard_type(format) else { continue };
+                    let uti = super::util::nsstring(uti);
+                    let data: *mut AnyObject = msg_send![pasteboard, dataForPasteboardType: uti];
+                    if data.is_null() {
+                        continue;
+                    }
+                    let len: usize = msg_send![data, length];
+                    // `-[NSData bytes]` is `const void *`: the pointer must be received as
+                    // one (objc2 checks the encoding in debug builds) and cast afterwards.
+                    let ptr: *const std::ffi::c_void = msg_send![data, bytes];
+                    if ptr.is_null() || len == 0 {
+                        continue;
+                    }
+                    let bytes = std::slice::from_raw_parts(ptr.cast::<u8>(), len).to_vec();
+                    let id = image_id(&bytes);
+                    return Some(ClipboardItem::new_image(&Image { format, bytes, id }));
+                }
+            }
             let string: *mut AnyObject = msg_send![pasteboard, string];
             if string.is_null() {
                 return None;
@@ -634,4 +672,39 @@ mod security {
     pub const ERR_SEC_SUCCESS: OSStatus = 0;
     pub const ERR_SEC_USER_CANCELED: OSStatus = -128;
     pub const ERR_SEC_ITEM_NOT_FOUND: OSStatus = -25300;
+}
+
+/// The picture formats read off the pasteboard, most likely on a phone first (a screenshot
+/// is a PNG, a photo a JPEG).
+const PASTED_FORMATS: [ImageFormat; 6] = [
+    ImageFormat::Png,
+    ImageFormat::Jpeg,
+    ImageFormat::Gif,
+    ImageFormat::Webp,
+    ImageFormat::Tiff,
+    ImageFormat::Bmp,
+];
+
+/// The uniform type identifier `UIPasteboard` files a picture of `format` under (the
+/// `UTType` identifiers of UniformTypeIdentifiers: `UTTypePNG`, `UTTypeJPEG`, `UTTypeGIF`,
+/// `UTTypeWebP`, `UTTypeTIFF`, `UTTypeBMP`); `None` for a format the pasteboard has no
+/// public type for.
+fn pasteboard_type(format: ImageFormat) -> Option<&'static str> {
+    Some(match format {
+        ImageFormat::Png => "public.png",
+        ImageFormat::Jpeg => "public.jpeg",
+        ImageFormat::Gif => "com.compuserve.gif",
+        ImageFormat::Webp => "org.webmproject.webp",
+        ImageFormat::Tiff => "public.tiff",
+        ImageFormat::Bmp => "com.microsoft.bmp",
+        ImageFormat::Svg | ImageFormat::Ico | ImageFormat::Pnm => return None,
+    })
+}
+
+/// A stable id for a pasted picture: the hash of its bytes, as the macOS pasteboard assigns.
+fn image_id(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
