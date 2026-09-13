@@ -115,7 +115,7 @@ impl Keystroke {
     /// key syntax is:
     /// [secondary-][ctrl-][alt-][shift-][cmd-][fn-]key[->key_char]
     /// key_char syntax is only used for generating test events,
-    /// secondary means "cmd" on macOS and "ctrl" on other platforms
+    /// secondary means "cmd" on macOS and iOS and "ctrl" on other platforms
     /// when matching a key with an key_char set will be matched without it.
     pub fn parse(source: &str) -> std::result::Result<Self, InvalidKeystrokeError> {
         let mut modifiers = Modifiers::none();
@@ -141,7 +141,7 @@ impl Keystroke {
                 continue;
             }
             if component.eq_ignore_ascii_case("secondary") {
-                if cfg!(target_os = "macos") {
+                if cfg!(any(target_os = "macos", target_os = "ios")) {
                     modifiers.platform = true;
                 } else {
                     modifiers.control = true;
@@ -478,15 +478,15 @@ impl Modifiers {
 
     /// Whether the semantically 'secondary' modifier key is pressed.
     ///
-    /// On macOS, this is the command key.
+    /// On macOS and iOS, this is the command key.
     /// On Linux and Windows, this is the control key.
     pub fn secondary(&self) -> bool {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             self.platform
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             self.control
         }
@@ -516,7 +516,7 @@ impl Modifiers {
 
     /// A Returns [`Modifiers`] with just the secondary key pressed.
     pub fn secondary_key() -> Modifiers {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             Modifiers {
                 platform: true,
@@ -524,7 +524,7 @@ impl Modifiers {
             }
         }
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         {
             Modifiers {
                 control: true,
@@ -682,21 +682,21 @@ impl AsKeystroke for KeybindingKeystroke {
 
 fn display_modifiers(modifiers: &Modifiers, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     if modifiers.control {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         f.write_char('^')?;
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         write!(f, "ctrl-")?;
     }
     if modifiers.alt {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         f.write_char('⌥')?;
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         write!(f, "alt-")?;
     }
     if modifiers.platform {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         f.write_char('⌘')?;
 
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
@@ -706,10 +706,10 @@ fn display_modifiers(modifiers: &Modifiers, f: &mut std::fmt::Formatter<'_>) -> 
         f.write_char('⊞')?;
     }
     if modifiers.shift {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         f.write_char('⇧')?;
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
         write!(f, "shift-")?;
     }
     Ok(())
@@ -717,27 +717,27 @@ fn display_modifiers(modifiers: &Modifiers, f: &mut std::fmt::Formatter<'_>) -> 
 
 fn display_key(key: &str, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     let key = match key {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "backspace" => '⌫',
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "up" => '↑',
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "down" => '↓',
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "left" => '←',
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "right" => '→',
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "tab" => '⇥',
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "escape" => '⎋',
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "shift" => '⇧',
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "control" => '⌃',
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "alt" => '⌥',
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         "platform" => '⌘',
 
         key if key.len() == 1 => key.chars().next().unwrap().to_ascii_uppercase(),
@@ -759,7 +759,7 @@ fn unparse(modifiers: &Modifiers, key: &str) -> String {
         result.push_str("alt-");
     }
     if modifiers.platform {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
         result.push_str("cmd-");
 
         #[cfg(any(target_os = "linux", target_os = "freebsd"))]
