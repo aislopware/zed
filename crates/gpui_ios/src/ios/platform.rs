@@ -368,6 +368,8 @@ impl Platform for IosPlatform {
         // iOS handles app reopening through scene lifecycle
     }
 
+    fn on_system_sleep(&self, _callback: Box<dyn FnMut()>) {}
+
     fn on_system_wake(&self, _callback: Box<dyn FnMut()>) {}
 
     fn on_app_lifecycle(&self, callback: Box<dyn FnMut(AppLifecyclePhase)>) {
@@ -464,7 +466,9 @@ impl Platform for IosPlatform {
             let has_images: Bool = msg_send![pasteboard, hasImages];
             if has_images.as_bool() {
                 for format in PASTED_FORMATS {
-                    let Some(uti) = pasteboard_type(format) else { continue };
+                    let Some(uti) = pasteboard_type(format) else {
+                        continue;
+                    };
                     let uti = super::util::nsstring(uti);
                     let data: *mut AnyObject = msg_send![pasteboard, dataForPasteboardType: uti];
                     if data.is_null() {

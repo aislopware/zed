@@ -20,8 +20,8 @@ use gpui::{
     Keystroke, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
     PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
     Scene, Size, TextInputStateChange, TouchEvent, TouchId, TouchPhase, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams, px,
-    size,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
+    WindowVisibility, px, size,
 };
 use gpui_apple::metal_renderer::{Context as MetalContext, MetalRenderer};
 use objc2::encode::{Encode, Encoding, RefEncode};
@@ -739,6 +739,10 @@ pub(crate) struct IosWindow {
     active_status_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
     /// Callback for hover status changes (not really applicable on iOS)
     hover_status_callback: RefCell<Option<Box<dyn FnMut(bool)>>>,
+    /// Whether the app is on screen: hidden from `didEnterBackground` to `willEnterForeground`.
+    visibility: RefCell<WindowVisibility>,
+    /// Callback for visibility transitions
+    visibility_callback: RefCell<Option<Box<dyn FnMut(WindowVisibility)>>>,
     /// Callback for resize events
     resize_callback: RefCell<Option<Box<dyn FnMut(Size<Pixels>, f32)>>>,
     /// Callback for move events (not applicable on iOS)
@@ -889,6 +893,8 @@ impl IosWindow {
                 input_callback: RefCell::new(None),
                 active_status_callback: RefCell::new(None),
                 hover_status_callback: RefCell::new(None),
+                visibility: RefCell::new(WindowVisibility::Visible),
+                visibility_callback: RefCell::new(None),
                 resize_callback: RefCell::new(None),
                 moved_callback: RefCell::new(None),
                 should_close_callback: RefCell::new(None),
@@ -1402,6 +1408,24 @@ impl IosWindow {
         }
     }
 
+    /// Notify the window that the app left or came back to the screen.
+    ///
+    /// Called by the FFI layer on `didEnterBackground` / `willEnterForeground`; only a
+    /// transition reaches the callback.
+    pub fn notify_visibility_change(&self, visible: bool) {
+        let next = if visible {
+            WindowVisibility::Visible
+        } else {
+            WindowVisibility::Hidden
+        };
+        if self.visibility.replace(next) == next {
+            return;
+        }
+        if let Some(callback) = self.visibility_callback.borrow_mut().as_mut() {
+            callback(next);
+        }
+    }
+
     pub fn handle_layout_change(&self) {
         unsafe {
             let view_bounds: ObjcCGRect = msg_send![self.view, bounds];
@@ -1632,6 +1656,14 @@ impl PlatformWindow for IosWindow {
 
     fn on_active_status_change(&self, callback: Box<dyn FnMut(bool)>) {
         *self.active_status_callback.borrow_mut() = Some(callback);
+    }
+
+    fn visibility(&self) -> WindowVisibility {
+        *self.visibility.borrow()
+    }
+
+    fn on_visibility_change(&self, callback: Box<dyn FnMut(WindowVisibility)>) {
+        *self.visibility_callback.borrow_mut() = Some(callback);
     }
 
     fn on_hover_status_change(&self, callback: Box<dyn FnMut(bool)>) {
