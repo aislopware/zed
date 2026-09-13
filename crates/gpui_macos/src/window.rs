@@ -2524,10 +2524,35 @@ extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+            CursorStyle::None => transparent_cursor(),
         };
 
         let bounds = NSView::bounds(this as *const Object as id);
         let _: () = msg_send![this, addCursorRect: bounds cursor: cursor];
+    }
+}
+
+/// An autoreleased `NSCursor` whose picture is a single clear pixel.
+///
+/// Registered as a cursor rect it hides the pointer only while it is over the view, and
+/// AppKit brings the arrow back by itself once the pointer leaves, which a balanced
+/// `NSCursor hide`/`unhide` pair could not guarantee.
+///
+/// # Safety
+///
+/// Must run on the AppKit main thread inside an autorelease pool, which is where
+/// `resetCursorRects` is invoked.
+unsafe fn transparent_cursor() -> id {
+    // SAFETY: `NSImage initWithSize:` yields an image with no drawn content, so every pixel
+    // is clear; `NSCursor initWithImage:hotSpot:` accepts any image. Both objects are
+    // autoreleased into the caller's pool, and `addCursorRect:cursor:` retains the cursor.
+    unsafe {
+        let image: id = msg_send![class!(NSImage), alloc];
+        let image: id = msg_send![image, initWithSize: NSSize::new(1.0, 1.0)];
+        let image: id = msg_send![image, autorelease];
+        let cursor: id = msg_send![class!(NSCursor), alloc];
+        let cursor: id = msg_send![cursor, initWithImage: image hotSpot: NSPoint::new(0.0, 0.0)];
+        msg_send![cursor, autorelease]
     }
 }
 

@@ -208,6 +208,13 @@ pub fn cursor_style_methods(input: TokenStream) -> TokenStream {
             self
         }
 
+        /// Hides the pointer while it hovers over an element, cursor style `none`.
+        /// [Docs](https://tailwindcss.com/docs/cursor)
+        #visibility fn cursor_none(mut self) -> Self {
+            self.style().mouse_cursor = Some(gpui::CursorStyle::None);
+            self
+        }
+
         /// Sets cursor style when hovering over an element to `crosshair`.
         /// [Docs](https://tailwindcss.com/docs/cursor)
         #visibility fn cursor_crosshair(mut self) -> Self {

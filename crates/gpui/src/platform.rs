@@ -2515,6 +2515,11 @@ pub enum CursorStyle {
     /// A cursor indicating that the operation will result in a context menu
     /// corresponds to the CSS cursor value `context-menu`
     ContextualMenu,
+
+    /// No pointer at all while it is over the element, corresponds to the CSS
+    /// cursor value `none`. Used when the element draws its own pointer, as a
+    /// remote-desktop view does with the far side's cursor.
+    None,
 }
 
 /// A clipboard item that should be copied to the clipboard
