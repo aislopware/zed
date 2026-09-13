@@ -171,6 +171,16 @@ fn notify_windows_active(is_active: bool) {
     }
 }
 
+fn notify_windows_visible(visible: bool) {
+    unsafe {
+        for &window in &*window_list().0.get() {
+            if let Some(window) = window.as_ref() {
+                window.notify_visibility_change(visible);
+            }
+        }
+    }
+}
+
 fn notify_app_lifecycle(phase: AppLifecyclePhase) {
     let callback = unsafe { (*app_state().callbacks.get()).app_lifecycle.take() };
     if let Some(mut callback) = callback {
@@ -184,6 +194,7 @@ fn notify_app_lifecycle(phase: AppLifecyclePhase) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_will_enter_foreground(_app: *mut c_void) {
+    notify_windows_visible(true);
     notify_windows_active(true);
     notify_app_lifecycle(AppLifecyclePhase::Foreground);
 }
@@ -203,6 +214,7 @@ pub extern "C" fn gpui_ios_will_resign_active(_app: *mut c_void) {
 #[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_did_enter_background(_app: *mut c_void) {
     notify_windows_active(false);
+    notify_windows_visible(false);
     notify_app_lifecycle(AppLifecyclePhase::Background);
 }
 
