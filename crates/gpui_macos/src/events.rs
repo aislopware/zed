@@ -240,6 +240,9 @@ pub(crate) unsafe fn platform_input_from_native(
                         TouchPhase::Started
                     }
                     NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
+                    // A gesture the system takes back never sends `Ended`, so folding this into
+                    // `Moved` leaves every consumer holding a gesture that never finishes.
+                    NSEventPhase::NSEventPhaseCancelled => TouchPhase::Cancelled,
                     _ => TouchPhase::Moved,
                 };
 
@@ -261,6 +264,9 @@ pub(crate) unsafe fn platform_input_from_native(
                         TouchPhase::Started
                     }
                     NSEventPhase::NSEventPhaseEnded => TouchPhase::Ended,
+                    // A gesture the system takes back never sends `Ended`, so folding this into
+                    // `Moved` leaves every consumer holding a gesture that never finishes.
+                    NSEventPhase::NSEventPhaseCancelled => TouchPhase::Cancelled,
                     _ => TouchPhase::Moved,
                 };
 
