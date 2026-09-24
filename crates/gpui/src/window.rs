@@ -4774,7 +4774,7 @@ impl Window {
         if !raster_bounds.is_zero() {
             let tile = self
                 .sprite_atlas
-                .get_or_insert_with(&params.clone().into(), &mut || {
+                .get_or_insert_with(params.clone().into(), &mut || {
                     let (size, bytes) = self.text_system().rasterize_glyph(&params)?;
                     Ok(Some((size, Cow::Owned(bytes))))
                 })?
