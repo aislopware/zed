@@ -150,6 +150,11 @@ pub struct MetalRenderer {
     /// looked, filled from a Metal thread.
     presentations: Arc<Mutex<Vec<PresentedFrame>>>,
     pacer: PresentationPacer,
+    /// Whether this layer's drawables report their presentation, learned from the first one.
+    /// The iOS simulator's `CAMetalDrawable` implements neither `addPresentedHandler:` nor
+    /// `presentedTime`; there no frame is reported, rather than a made-up instant, and the
+    /// pacer never sees a queue.
+    drawables_report_presentation: Option<bool>,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -442,6 +447,7 @@ impl MetalRenderer {
             presents_with_transaction: false,
             presented_frame_sink: None,
             presentations: Arc::default(),
+            drawables_report_presentation: None,
             pacer: PresentationPacer::new(DEFAULT_REFRESH),
             is_apple_gpu,
             is_unified_memory,
@@ -610,11 +616,19 @@ impl MetalRenderer {
             }
         };
 
-        observe_presentation(
-            drawable,
-            self.presentations.clone(),
-            self.presented_frame_sink.clone(),
-        );
+        let reports_presentation = *self.drawables_report_presentation.get_or_insert_with(|| {
+            // SAFETY: `respondsToSelector:` is an `NSObject` method every drawable has.
+            let responds: objc::runtime::BOOL =
+                unsafe { msg_send![drawable, respondsToSelector: sel!(addPresentedHandler:)] };
+            responds == YES
+        });
+        if reports_presentation {
+            observe_presentation(
+                drawable,
+                self.presentations.clone(),
+                self.presented_frame_sink.clone(),
+            );
+        }
         self.pacer.submitted(Instant::now());
         if self.presents_with_transaction {
             command_buffer.commit();
