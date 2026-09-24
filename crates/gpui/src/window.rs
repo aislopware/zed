@@ -2241,8 +2241,8 @@ impl Window {
     ///
     /// Key-to-photon latency is the gap from an input event to the `presented_at` of the
     /// first frame whose `submitted_at` follows the event's handling. Frames are only
-    /// reported on platforms that observe presentation (macOS and iOS); elsewhere the
-    /// callback never runs. Reporting costs a little per frame, so it is only switched on
+    /// reported on platforms that observe presentation (macOS and iOS devices); elsewhere,
+    /// the iOS simulator included, the callback never runs. Reporting costs a little per frame, so it is only switched on
     /// while a subscription is alive.
     pub fn on_frame_presented(
         &self,
