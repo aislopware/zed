@@ -969,6 +969,7 @@ impl IosWindow {
             );
             renderer.update_drawable_size(size(DevicePixels(pixel_w), DevicePixels(pixel_h)));
             let (display_link, refresh_interval) = paused_display_link(view, screen_obj);
+            renderer.set_refresh_interval(refresh_interval);
 
             let ios_window = Self {
                 window,
@@ -1186,6 +1187,10 @@ impl IosWindow {
     /// Runs one GPUI frame for the display link or an immediate draw, then pauses the link
     /// when nothing asked for another.
     fn run_frame(&self, source: FrameSource) {
+        // A held tick leaves the link running and GPUI's demand in place for the next one.
+        if source == FrameSource::DisplayLink && !self.renderer.lock().ready_for_vsync_frame() {
+            return;
+        }
         if !self
             .frame_pacer
             .borrow_mut()

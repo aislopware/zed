@@ -7,3 +7,4 @@
 
 mod metal_atlas;
 pub mod metal_renderer;
+mod presentation_pacing;

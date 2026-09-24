@@ -665,6 +665,8 @@ struct MacWindowState {
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
+    /// A vsync tick passed since the last immediate frame; see `immediate_frame`.
+    immediate_frame_armed: bool,
     renderer: renderer::Renderer,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
     event_callback: Option<Box<dyn FnMut(PlatformInput) -> gpui::DispatchEventResult>>,
@@ -842,10 +844,18 @@ impl MacWindowState {
                 return;
             }
         }
-        let Some(display_id) = display_id_for_screen(unsafe { self.native_window.screen() }) else {
+        let screen = unsafe { self.native_window.screen() };
+        let Some(display_id) = display_id_for_screen(screen) else {
             // AppKit can temporarily report no screen while displays are being reconfigured.
             return;
         };
+        // AppKit: NSScreen.minimumRefreshInterval, the refresh a variable-rate panel reaches
+        // at its fastest.
+        let refresh: f64 = unsafe { msg_send![screen, minimumRefreshInterval] };
+        if refresh > 0.0 {
+            self.renderer
+                .set_refresh_interval(Duration::from_secs_f64(refresh));
+        }
         let data = self.native_view.as_ptr() as *mut c_void;
         self.frame_source
             .get_or_insert_with(|| WindowFrameSource::new(data, step))
@@ -1098,6 +1108,7 @@ impl MacWindow {
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
+                immediate_frame_armed: false,
                 renderer: renderer::new_renderer(
                     renderer_context,
                     native_window as *mut _,
@@ -2009,6 +2020,20 @@ impl PlatformWindow for MacWindow {
                 .styleMask()
                 .contains(NSWindowStyleMask::NSFullScreenWindowMask)
         }
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // Weak, because the window state owns GPUI's frame callback, which owns this waker.
+        let window_state = Arc::downgrade(&self.0);
+        Some(Rc::new(move || {
+            // Called with GPUI mid-update, so the frame goes to the next main-queue turn.
+            let window_state = Weak::into_raw(window_state.clone());
+            // SAFETY: `immediate_frame` takes over the reference `into_raw` handed out, and
+            // runs on the main thread, where window state is used.
+            unsafe {
+                DispatchQueue::main().exec_async_f(window_state.cast_mut().cast(), immediate_frame)
+            };
+        }))
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
@@ -3332,7 +3357,37 @@ extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    lock.immediate_frame_armed = true;
+    if !lock.renderer.ready_for_vsync_frame() {
+        return;
+    }
 
+    if let Some(mut callback) = lock.request_frame_callback.take() {
+        drop(lock);
+        callback(Default::default());
+        window_state.lock().request_frame_callback = Some(callback);
+    }
+}
+
+/// A frame drawn as soon as GPUI wants one after idle, instead of at the next vsync tick, so
+/// a keystroke into a quiet window reaches the glass up to a refresh sooner. At most one runs
+/// between two ticks, and only when no frame began for a refresh, which keeps a notifier that
+/// is faster than the display, or a throttled window, from drawing out of step with it.
+extern "C" fn immediate_frame(window_state: *mut c_void) {
+    // SAFETY: `frame_waker` passed a reference from `Weak::into_raw` for this call to own.
+    let window_state = unsafe { Weak::from_raw(window_state.cast::<Mutex<MacWindowState>>()) };
+    let Some(window_state) = window_state.upgrade() else {
+        return;
+    };
+    let mut lock = window_state.lock();
+    let armed = mem::take(&mut lock.immediate_frame_armed);
+    let ticking = lock
+        .frame_source
+        .as_ref()
+        .is_some_and(WindowFrameSource::is_running);
+    if !armed || !ticking || !lock.renderer.idle_for_a_refresh() {
+        return;
+    }
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
         callback(Default::default());
