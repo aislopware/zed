@@ -8,6 +8,8 @@
 pub mod ios;
 
 pub mod described;
+#[cfg(any(target_os = "ios", test))]
+mod frame_pacing;
 pub mod hardware_keyboard;
 
 #[cfg(target_os = "ios")]

@@ -14,6 +14,7 @@ use super::events::*;
 #[cfg(feature = "test-support")]
 use crate::described::DescribedInput;
 use crate::described::{DescribedPinch, GestureState, PressPhase, UiTouchPhase};
+use crate::frame_pacing::{FramePacer, FrameSource, Wake};
 use crate::hardware_keyboard::{self, UiKey};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, DevicePixels, DispatchEventResult, Edges, GpuSpecs,
@@ -25,8 +26,10 @@ use gpui::{
 };
 use gpui_apple::metal_renderer::{Context as MetalContext, MetalRenderer};
 use objc2::encode::{Encode, Encoding, RefEncode};
+use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, ClassBuilder, Sel};
 use objc2::{class, msg_send, sel};
+use objc2_foundation::{NSRunLoop, NSRunLoopCommonModes};
 
 use super::cg_types::ObjcCGRect;
 use parking_lot::Mutex;
@@ -37,6 +40,7 @@ use std::{
     ptr::{self, NonNull},
     rc::Rc,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 const GPUI_WINDOW_IVAR: &str = "gpui_window_ptr";
@@ -179,6 +183,13 @@ fn register_metal_view_class() -> &'static AnyClass {
             Bool::NO
         }
 
+        // The window's CADisplayLink calls its view, which finds the window through the ivar.
+        extern "C" fn display_link_fired(this: *mut AnyObject, _sel: Sel, _link: *mut AnyObject) {
+            if let Some(window) = unsafe { window_of_view(this) } {
+                window.run_frame(FrameSource::DisplayLink);
+            }
+        }
+
         // Touch handling methods
         extern "C" fn touches_began(
             this: *mut AnyObject,
@@ -305,6 +316,10 @@ fn register_metal_view_class() -> &'static AnyClass {
                 is_accessibility_element as extern "C" fn(*mut AnyObject, Sel) -> Bool,
             );
             decl.add_method(
+                sel!(gpuiDisplayLinkFired:),
+                display_link_fired as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+            );
+            decl.add_method(
                 sel!(handlePinch:),
                 handle_pinch as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
             );
@@ -362,6 +377,77 @@ fn register_metal_view_class() -> &'static AnyClass {
     });
 
     class!(GPUIMetalView)
+}
+
+/// The window a `GPUIMetalView` serves, or `None` once the window has been dropped.
+///
+/// # Safety
+///
+/// `view` must be a live `GPUIMetalView`, used on the main thread.
+unsafe fn window_of_view<'a>(view: *mut AnyObject) -> Option<&'a IosWindow> {
+    // SAFETY: The ivar holds the window's stable boxed address from `register_with_ffi` until
+    // `Drop` nulls it, and the window is only touched on the main thread.
+    unsafe {
+        #[allow(deprecated)]
+        let window_ptr: *mut c_void = *(*view).get_ivar(GPUI_WINDOW_IVAR);
+        (window_ptr as *const IosWindow).as_ref()
+    }
+}
+
+/// `CAFrameRateRange` from QuartzCore/CAFrameRateRange.h.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct CAFrameRateRange {
+    minimum: f32,
+    maximum: f32,
+    preferred: f32,
+}
+
+// SAFETY: The layout above is the C struct's: three `float`s in declaration order.
+unsafe impl Encode for CAFrameRateRange {
+    const ENCODING: Encoding = Encoding::Struct(
+        "CAFrameRateRange",
+        &[Encoding::Float, Encoding::Float, Encoding::Float],
+    );
+}
+
+/// A paused `CADisplayLink` on the main run loop that sends `gpuiDisplayLinkFired:` to
+/// `view`, asking for the screen's full refresh rate. Returns the link, retained, and the
+/// screen's refresh interval.
+///
+/// # Safety
+///
+/// `view` must be a live `GPUIMetalView` and `screen` a live `UIScreen`, on the main thread.
+unsafe fn paused_display_link(
+    view: *mut AnyObject,
+    screen: *mut AnyObject,
+) -> (*mut AnyObject, Duration) {
+    unsafe {
+        let link: *mut AnyObject = msg_send![
+            class!(CADisplayLink),
+            displayLinkWithTarget: view,
+            selector: sel!(gpuiDisplayLinkFired:)
+        ];
+        let link: *mut AnyObject = msg_send![link, retain];
+        let max_fps: isize = msg_send![screen, maximumFramesPerSecond];
+        let max_fps = max_fps.max(1) as f32;
+        // Latency comes first: the full ProMotion rate while frames are wanted. The pause
+        // between them is what saves the power.
+        let range = CAFrameRateRange {
+            minimum: max_fps.min(60.),
+            maximum: max_fps,
+            preferred: max_fps,
+        };
+        let _: () = msg_send![link, setPreferredFrameRateRange: range];
+        let _: () = msg_send![link, setPaused: true];
+        // Common modes, so the link keeps ticking while UIKit tracks a scroll or a drag.
+        let _: () = msg_send![
+            link,
+            addToRunLoop: &*NSRunLoop::mainRunLoop(),
+            forMode: NSRunLoopCommonModes
+        ];
+        (link, Duration::from_secs_f32(1. / max_fps))
+    }
 }
 
 /// Register a custom UIView subclass that implements UIKeyInput protocol.
@@ -733,6 +819,9 @@ pub(crate) struct IosWindow {
     input_handler: RefCell<Option<PlatformInputHandler>>,
     request_frame_callback: RefCell<Option<Box<dyn FnMut(RequestFrameOptions)>>>,
     force_next_frame: Cell<bool>,
+    /// Drives frames while GPUI wants them and pauses otherwise; see `frame_pacing`.
+    display_link: *mut AnyObject,
+    frame_pacer: RefCell<FramePacer>,
     /// Callback for input events
     input_callback: RefCell<Option<Box<dyn FnMut(PlatformInput) -> DispatchEventResult>>>,
     /// Callback for active status changes
@@ -879,6 +968,7 @@ impl IosWindow {
                 false,
             );
             renderer.update_drawable_size(size(DevicePixels(pixel_w), DevicePixels(pixel_h)));
+            let (display_link, refresh_interval) = paused_display_link(view, screen_obj);
 
             let ios_window = Self {
                 window,
@@ -890,6 +980,8 @@ impl IosWindow {
                 input_handler: RefCell::new(None),
                 request_frame_callback: RefCell::new(None),
                 force_next_frame: Cell::new(true),
+                display_link,
+                frame_pacer: RefCell::new(FramePacer::new(refresh_interval)),
                 input_callback: RefCell::new(None),
                 active_status_callback: RefCell::new(None),
                 hover_status_callback: RefCell::new(None),
@@ -1091,7 +1183,53 @@ impl IosWindow {
         }
     }
 
-    pub(super) fn request_frame(&self) {
+    /// Runs one GPUI frame for the display link or an immediate draw, then pauses the link
+    /// when nothing asked for another.
+    fn run_frame(&self, source: FrameSource) {
+        if !self
+            .frame_pacer
+            .borrow_mut()
+            .begin_frame(source, Instant::now())
+        {
+            return;
+        }
+        self.request_frame();
+        if self.frame_pacer.borrow_mut().end_frame() {
+            self.set_display_link_paused(true);
+        }
+    }
+
+    /// GPUI's frame waker: GPUI wants a frame. Called with GPUI mid-update, so an immediate
+    /// frame goes to the next main-queue turn instead of running here.
+    fn wake_frames(&self) {
+        let visible = self.visibility.borrow().is_visible();
+        let wake = self.frame_pacer.borrow_mut().wake(Instant::now(), visible);
+        if wake == Wake::Nothing {
+            return;
+        }
+        self.set_display_link_paused(false);
+        if wake == Wake::ResumeAndDrawNow {
+            // SAFETY: `self.view` is this window's live view; the retain keeps it alive for
+            // the queued frame, which finds the window through its ivar or finds none.
+            let Some(view) = (unsafe { Retained::retain(self.view) }) else {
+                return;
+            };
+            super::on_main(Box::new(move || {
+                if let Some(window) = unsafe { window_of_view(Retained::as_ptr(&view).cast_mut()) }
+                {
+                    window.run_frame(FrameSource::Immediate);
+                }
+            }));
+        }
+    }
+
+    fn set_display_link_paused(&self, paused: bool) {
+        unsafe {
+            let _: () = msg_send![self.display_link, setPaused: paused];
+        }
+    }
+
+    fn request_frame(&self) {
         let callback = self.request_frame_callback.borrow_mut().take();
         if let Some(mut callback) = callback {
             let force_render = self.force_next_frame.replace(false);
@@ -1492,6 +1630,9 @@ impl Drop for IosWindow {
         super::ffi::unregister_window(self);
 
         unsafe {
+            // Takes the link off the run loop, which releases the view it targets.
+            let _: () = msg_send![self.display_link, invalidate];
+            let _: () = msg_send![self.display_link, release];
             #[allow(deprecated)]
             {
                 *(*self.view).get_mut_ivar::<*mut c_void>(GPUI_WINDOW_IVAR) = ptr::null_mut();
@@ -1644,6 +1785,18 @@ impl PlatformWindow for IosWindow {
 
     fn is_fullscreen(&self) -> bool {
         true
+    }
+
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // GPUI keeps the waker past the window's drop; the view is retained here and the
+        // window found through its ivar, which is null by then.
+        // SAFETY: `self.view` is this window's live view.
+        let view = unsafe { Retained::retain(self.view) }?;
+        Some(Rc::new(move || {
+            if let Some(window) = unsafe { window_of_view(Retained::as_ptr(&view).cast_mut()) } {
+                window.wake_frames();
+            }
+        }))
     }
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
