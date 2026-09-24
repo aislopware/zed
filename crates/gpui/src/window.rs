@@ -5573,7 +5573,13 @@ impl Window {
         let old_modality = self.last_input_modality;
         self.last_input_modality = match &event {
             PlatformInput::KeyDown(_) => InputModality::Keyboard,
-            PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
+            // A drag from another app moves the pointer without mouse events; without this a
+            // drop after typing finds no hovered hitbox and falls through.
+            PlatformInput::MouseMove(_)
+            | PlatformInput::MouseDown(_)
+            | PlatformInput::FileDrop(
+                FileDropEvent::Entered { .. } | FileDropEvent::Pending { .. },
+            ) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
         };
