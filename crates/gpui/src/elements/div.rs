@@ -5555,15 +5555,19 @@ mod tests {
 
     impl Render for LabelledButton {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-            div().id("root").role(accesskit::Role::Group).size_full().child(
-                div()
-                    .id("save")
-                    .role(accesskit::Role::Button)
-                    .aria_label("Save")
-                    .on_click(|_, _, _| {})
-                    .w(px(40.))
-                    .h(px(20.)),
-            )
+            div()
+                .id("root")
+                .role(accesskit::Role::Group)
+                .size_full()
+                .child(
+                    div()
+                        .id("save")
+                        .role(accesskit::Role::Button)
+                        .aria_label("Save")
+                        .on_click(|_, _, _| {})
+                        .w(px(40.))
+                        .h(px(20.)),
+                )
         }
     }
 
