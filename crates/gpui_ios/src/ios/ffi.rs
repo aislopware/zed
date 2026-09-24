@@ -266,14 +266,6 @@ pub extern "C" fn gpui_ios_handle_touch(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn gpui_ios_request_frame(window: *mut c_void) {
-    let Some(window) = ios_window(window) else {
-        return;
-    };
-    window.request_frame();
-}
-
-#[unsafe(no_mangle)]
 pub extern "C" fn gpui_ios_show_keyboard(window: *mut c_void) {
     if let Some(window) = ios_window(window) {
         window.show_keyboard();

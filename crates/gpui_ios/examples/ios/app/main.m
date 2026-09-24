@@ -1,9 +1,6 @@
-#import <QuartzCore/QuartzCore.h>
 #import <UIKit/UIKit.h>
 
 extern bool gpui_ios_example_run(void);
-extern void *gpui_ios_get_window(void);
-extern void gpui_ios_request_frame(void *window);
 extern void gpui_ios_will_enter_foreground(void *application);
 extern void gpui_ios_did_become_active(void *application);
 extern void gpui_ios_will_resign_active(void *application);
@@ -14,7 +11,6 @@ extern void gpui_ios_handle_open_url(void *url);
 extern void gpui_ios_set_window_scene(void *scene);
 
 @interface GPUIExampleSceneDelegate : UIResponder <UIWindowSceneDelegate>
-@property(nonatomic, strong) CADisplayLink *displayLink;
 @end
 
 @interface GPUIAppDelegate : UIResponder <UIApplicationDelegate>
@@ -30,20 +26,8 @@ extern void gpui_ios_set_window_scene(void *scene);
     }
 
     gpui_ios_set_window_scene((__bridge void *)scene);
-    if (!gpui_ios_example_run()) {
-        return;
-    }
-
-    self.displayLink = [CADisplayLink displayLinkWithTarget:self
-                                                  selector:@selector(renderFrame:)];
-    [self.displayLink addToRunLoop:NSRunLoop.mainRunLoop forMode:NSRunLoopCommonModes];
-}
-
-- (void)renderFrame:(CADisplayLink *)displayLink {
-    void *window = gpui_ios_get_window();
-    if (window != NULL) {
-        gpui_ios_request_frame(window);
-    }
+    // Each GPUI window drives its own frames from a display link it pauses when idle.
+    gpui_ios_example_run();
 }
 
 - (void)sceneWillEnterForeground:(UIScene *)scene {
@@ -60,10 +44,6 @@ extern void gpui_ios_set_window_scene(void *scene);
 
 - (void)sceneDidEnterBackground:(UIScene *)scene {
     gpui_ios_did_enter_background((__bridge void *)scene);
-}
-
-- (void)sceneDidDisconnect:(UIScene *)scene {
-    [self.displayLink invalidate];
 }
 
 - (void)scene:(UIScene *)scene
