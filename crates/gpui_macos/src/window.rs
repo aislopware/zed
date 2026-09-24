@@ -2115,6 +2115,10 @@ impl PlatformWindow for MacWindow {
         this.renderer.draw(scene);
     }
 
+    fn set_presented_frame_sink(&self, sink: Option<gpui::PresentedFrameSink>) {
+        self.0.lock().renderer.set_presented_frame_sink(sink);
+    }
+
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {
         self.0.lock().renderer.sprite_atlas().clone()
     }

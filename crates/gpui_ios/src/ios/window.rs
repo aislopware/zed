@@ -1698,6 +1698,10 @@ impl PlatformWindow for IosWindow {
         self.renderer.lock().draw(scene);
     }
 
+    fn set_presented_frame_sink(&self, sink: Option<gpui::PresentedFrameSink>) {
+        self.renderer.lock().set_presented_frame_sink(sink);
+    }
+
     /// Draws `scene` into an offscreen texture the size of the layer's drawable and reads it
     /// back. Offscreen rather than through `CAMetalLayer.nextDrawable`: the layer's drawables
     /// belong to the display link, and a backgrounded simulator app may have none to give,

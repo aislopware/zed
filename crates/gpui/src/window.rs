@@ -14,15 +14,16 @@ use crate::{
     KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
     MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
     PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextInputStateChange, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
-    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
-    WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
+    PresentedFrame, PresentedFrameSink, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextInputConfiguration, TextInputStateChange, TextRenderingMode, TextStyle,
+    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
+    WindowOptions, WindowParams, WindowTextSystem, WindowVisibility, point, prelude::*, px, rems,
+    size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -1211,6 +1212,12 @@ pub struct Window {
     visibility: WindowVisibility,
     pub(crate) visibility_observers:
         SubscriberSet<(), Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
+    frame_presented_observers:
+        SubscriberSet<(), Box<dyn FnMut(PresentedFrame, &mut Window, &mut App) -> bool>>,
+    /// Handed to the platform window while anything observes presented frames; installing
+    /// it costs a handler per frame, so it is removed once the last observer is gone.
+    presented_frame_sink: PresentedFrameSink,
+    presented_frame_sink_installed: Cell<bool>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
@@ -1914,6 +1921,25 @@ impl Window {
                     .log_err();
             }
         }));
+        // The platform reports presentation off the main thread; the channel brings each
+        // frame back to it, where observers run with the window and app borrowed.
+        let (presented_sender, presented_receiver) = async_channel::unbounded::<PresentedFrame>();
+        let presented_frame_sink: PresentedFrameSink = Arc::new(move |frame| {
+            presented_sender.try_send(frame).ok();
+        });
+        let mut async_cx = cx.to_async();
+        cx.foreground_executor()
+            .spawn(async move {
+                while let Ok(frame) = presented_receiver.recv().await {
+                    let delivered = handle.update(&mut async_cx, |_, window, cx| {
+                        window.frame_presented(frame, cx);
+                    });
+                    if delivered.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
         platform_window.on_visibility_change(Box::new({
             let mut cx = cx.to_async();
             move |_| {
@@ -2066,6 +2092,9 @@ impl Window {
             active,
             visibility,
             visibility_observers: SubscriberSet::new(),
+            frame_presented_observers: SubscriberSet::new(),
+            presented_frame_sink,
+            presented_frame_sink_installed: Cell::new(false),
             hovered,
             needs_present,
             input_rate_tracker,
@@ -2204,6 +2233,44 @@ impl Window {
         );
         activate();
         subscription
+    }
+
+    /// Registers a callback for every frame of this window the display shows, with the
+    /// instant it reached the glass. It runs on the main thread, shortly after the
+    /// presentation.
+    ///
+    /// Key-to-photon latency is the gap from an input event to the `presented_at` of the
+    /// first frame whose `submitted_at` follows the event's handling. Frames are only
+    /// reported on platforms that observe presentation (macOS and iOS); elsewhere the
+    /// callback never runs. Reporting costs a little per frame, so it is only switched on
+    /// while a subscription is alive.
+    pub fn on_frame_presented(
+        &self,
+        mut callback: impl FnMut(PresentedFrame, &mut Window, &mut App) + 'static,
+    ) -> Subscription {
+        let (subscription, activate) = self.frame_presented_observers.insert(
+            (),
+            Box::new(move |frame, window, cx| {
+                callback(frame, window, cx);
+                true
+            }),
+        );
+        activate();
+        if !self.presented_frame_sink_installed.replace(true) {
+            self.platform_window
+                .set_presented_frame_sink(Some(self.presented_frame_sink.clone()));
+        }
+        subscription
+    }
+
+    fn frame_presented(&mut self, frame: PresentedFrame, cx: &mut App) {
+        self.frame_presented_observers
+            .clone()
+            .retain(&(), |callback| callback(frame, self, cx));
+        if self.frame_presented_observers.is_empty() && self.presented_frame_sink_installed.get() {
+            self.presented_frame_sink_installed.set(false);
+            self.platform_window.set_presented_frame_sink(None);
+        }
     }
 
     /// Registers a callback to be invoked when the window appearance changes.
@@ -7991,6 +8058,51 @@ mod tests {
                 (scale_factor, expected_bounds, resized_size)
             );
         }
+    }
+
+    /// Presented frames reach observers from the platform's sink, and the platform is only
+    /// asked to report them while someone listens: the sink goes in with the first
+    /// subscription and comes out once the last one is gone.
+    #[gpui::test]
+    fn test_presented_frames_reach_observers_while_subscribed(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, _| EmptyView);
+        let test_window = cx.test_window(window.into());
+        let submitted_at = scheduler::Instant::now();
+        let frame = |after_ms| crate::PresentedFrame {
+            submitted_at,
+            presented_at: Some(submitted_at + Duration::from_millis(after_ms)),
+        };
+
+        assert!(
+            !test_window.simulate_frame_presented(frame(1)),
+            "no sink is installed before anyone subscribes"
+        );
+
+        let seen = Rc::new(RefCell::new(Vec::new()));
+        let subscription = window
+            .update(cx, |_, window, _| {
+                let seen = seen.clone();
+                window.on_frame_presented(move |frame, _, _| seen.borrow_mut().push(frame))
+            })
+            .unwrap();
+        let dropped = crate::PresentedFrame {
+            submitted_at,
+            presented_at: None,
+        };
+        assert!(test_window.simulate_frame_presented(frame(8)));
+        assert!(test_window.simulate_frame_presented(dropped));
+        cx.run_until_parked();
+        assert_eq!(*seen.borrow(), [frame(8), dropped]);
+
+        drop(subscription);
+        // The sink comes out on the first delivery nobody is left to receive.
+        assert!(test_window.simulate_frame_presented(frame(16)));
+        cx.run_until_parked();
+        assert_eq!(seen.borrow().len(), 2);
+        assert!(
+            !test_window.simulate_frame_presented(frame(24)),
+            "the sink is removed once the last observer is gone"
+        );
     }
 
     /// Platforms that stop requesting frames for idle windows (currently web)

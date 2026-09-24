@@ -1,9 +1,10 @@
 use crate::{
     AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, GpuSpecs, HeadlessAtlas, Pixels,
     PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size, TestPlatform,
-    TextInputConfiguration, TextInputStateChange, WindowAppearance, WindowBackgroundAppearance,
-    WindowBounds, WindowControlArea, WindowInsets, WindowParams, WindowVisibility,
+    PlatformWindow, Point, PresentedFrame, PresentedFrameSink, PromptButton, RequestFrameOptions,
+    Scene, Size, TestPlatform, TextInputConfiguration, TextInputStateChange, WindowAppearance,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
+    WindowVisibility,
 };
 use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "test-support"))]
@@ -48,6 +49,7 @@ pub(crate) struct TestWindowState {
     frame_wake_count: Rc<Cell<usize>>,
     frame_scheduled: bool,
     frame_callback_pending: bool,
+    presented_frame_sink: Option<PresentedFrameSink>,
     input_handler: Option<PlatformInputHandler>,
     text_input_configurations: Vec<TextInputConfiguration>,
     text_input_state_changes: Vec<TextInputStateChange>,
@@ -121,6 +123,7 @@ impl TestWindow {
             frame_wake_count: Rc::new(Cell::new(0)),
             frame_scheduled: false,
             frame_callback_pending: false,
+            presented_frame_sink: None,
             input_handler: None,
             text_input_configurations: Vec::new(),
             text_input_state_changes: Vec::new(),
@@ -255,6 +258,17 @@ impl TestWindow {
     /// Returns how many times this window's frame waker has been invoked.
     pub fn frame_wake_count(&self) -> usize {
         self.0.lock().frame_wake_count.get()
+    }
+
+    /// Reports `frame` as presented through the installed sink, as the platform's GPU
+    /// driver would. It stays on the calling thread, which the deterministic test scheduler
+    /// requires. Returns whether the window had a sink installed to take it.
+    pub fn simulate_frame_presented(&self, frame: PresentedFrame) -> bool {
+        let Some(sink) = self.0.lock().presented_frame_sink.clone() else {
+            return false;
+        };
+        sink(frame);
+        true
     }
 
     /// Delivers a frame request to the window, as the platform's frame source
@@ -477,6 +491,10 @@ impl PlatformWindow for TestWindow {
 
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.lock().request_frame_callback = Some(callback);
+    }
+
+    fn set_presented_frame_sink(&self, sink: Option<PresentedFrameSink>) {
+        self.0.lock().presented_frame_sink = sink;
     }
 
     fn schedule_frame(&self) {

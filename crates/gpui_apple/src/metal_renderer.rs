@@ -4,7 +4,7 @@ use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    PresentedFrame, PresentedFrameSink, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -42,7 +42,16 @@ use objc::{
 };
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, mem::MaybeUninit, ops::Range, ptr, slice, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem,
+    mem::MaybeUninit,
+    ops::Range,
+    ptr, slice,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -132,6 +141,8 @@ pub struct MetalRenderer {
     is_apple_gpu: bool,
     is_unified_memory: bool,
     presents_with_transaction: bool,
+    /// Receives each drawn frame once the display has shown it; see [`Self::draw`].
+    presented_frame_sink: Option<PresentedFrameSink>,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -165,6 +176,47 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+}
+
+/// Hands `sink` the frame in `drawable` once the display shows it, or learns it was dropped.
+/// Must run before the drawable is presented, as `addPresentedHandler:` requires.
+fn report_presentation(drawable: &metal::MetalDrawableRef, sink: PresentedFrameSink) {
+    let submitted_at = Instant::now();
+    let handler = RcBlock::new(move |drawable: ptr::NonNull<AnyObject>| {
+        // SAFETY: `addPresentedHandler:` calls the block with the `id<MTLDrawable>` it was
+        // added to, alive for the duration of the call.
+        let drawable = unsafe { metal::DrawableRef::from_ptr(drawable.as_ptr().cast()) };
+        sink(PresentedFrame {
+            submitted_at,
+            presented_at: host_time_to_instant(drawable.presented_time()),
+        });
+    });
+    // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI,
+    // and `addPresentedHandler:` copies the block before this one is released.
+    unsafe {
+        drawable.add_presented_handler(&*RcBlock::as_ptr(&handler).cast());
+    }
+}
+
+/// Converts a Core Animation host time (`CACurrentMediaTime` seconds, as `presentedTime`
+/// reports) to an `Instant`. `presentedTime` is zero for a drawable that was never shown.
+fn host_time_to_instant(host_time: f64) -> Option<Instant> {
+    #[link(name = "QuartzCore", kind = "framework")]
+    unsafe extern "C" {
+        // QuartzCore/CABase.h: CFTimeInterval CACurrentMediaTime(void).
+        fn CACurrentMediaTime() -> f64;
+    }
+    if host_time <= 0.0 {
+        return None;
+    }
+    let now = Instant::now();
+    // SAFETY: A pure function over the host clock, callable from any thread.
+    let age = unsafe { CACurrentMediaTime() } - host_time;
+    if age >= 0.0 {
+        now.checked_sub(Duration::from_secs_f64(age))
+    } else {
+        now.checked_add(Duration::from_secs_f64(-age))
+    }
 }
 
 #[repr(C)]
@@ -372,6 +424,7 @@ impl MetalRenderer {
             device,
             layer,
             presents_with_transaction: false,
+            presented_frame_sink: None,
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -422,6 +475,12 @@ impl MetalRenderer {
         if let Some(layer) = &self.layer {
             layer.set_presents_with_transaction(presents_with_transaction);
         }
+    }
+
+    /// Reports every frame [`Self::draw`] presents to `sink`, or stops with `None`. The sink
+    /// runs on a Metal thread.
+    pub fn set_presented_frame_sink(&mut self, sink: Option<PresentedFrameSink>) {
+        self.presented_frame_sink = sink;
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -513,6 +572,9 @@ impl MetalRenderer {
             }
         };
 
+        if let Some(sink) = &self.presented_frame_sink {
+            report_presentation(drawable, sink.clone());
+        }
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
