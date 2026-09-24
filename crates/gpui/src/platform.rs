@@ -807,6 +807,23 @@ pub struct RequestFrameOptions {
     pub force_render: bool,
 }
 
+/// A frame a window drew, reported once the display has shown it.
+///
+/// See [`Window::on_frame_presented`](crate::Window::on_frame_presented).
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct PresentedFrame {
+    /// When the platform window handed the frame to the GPU. The frame holds everything the
+    /// main thread did before this instant, so an input event handled earlier is in it.
+    pub submitted_at: Instant,
+    /// When the frame reached the display, or `None` when the system dropped it unshown
+    /// because a newer frame replaced it first.
+    pub presented_at: Option<Instant>,
+}
+
+/// Receives each [`PresentedFrame`] of a window, on whichever thread the platform learns
+/// of the presentation.
+pub type PresentedFrameSink = Arc<dyn Fn(PresentedFrame) + Send + Sync>;
+
 /// The application's lifecycle phase, as owned and reported by a mobile OS.
 ///
 /// `Inactive` means visible but not receiving input (a system dialog on
@@ -957,6 +974,10 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Installs the sink that receives every frame [`Self::draw`] submits once it has been
+    /// presented, or removes it with `None`. Called on the main thread; the sink may run on
+    /// any thread. A platform that cannot observe presentation ignores the sink.
+    fn set_presented_frame_sink(&self, _sink: Option<PresentedFrameSink>) {}
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;

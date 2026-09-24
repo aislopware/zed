@@ -105,6 +105,11 @@ where
             })
     }
 
+    /// Whether no subscriber, active or not, is registered for any emitter.
+    pub fn is_empty(&self) -> bool {
+        self.0.borrow().subscribers.is_empty()
+    }
+
     /// Call the given callback for each subscriber to the given emitter.
     /// If the callback returns false, the subscriber is removed.
     pub fn retain<F>(&self, emitter: &EmitterKey, mut f: F)
