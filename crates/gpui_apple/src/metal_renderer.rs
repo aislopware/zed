@@ -13,9 +13,20 @@ use objc2::runtime::AnyObject;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 use core_foundation::base::TCFType;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
+use core_foundation::string::CFString;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
 use core_video::{
-    metal_texture::CVMetalTextureGetTexture, metal_texture_cache::CVMetalTextureCache,
-    pixel_buffer::kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    buffer::TCVBuffer,
+    image_buffer::{
+        kCVImageBufferYCbCrMatrix_ITU_R_601_4, kCVImageBufferYCbCrMatrix_ITU_R_2020,
+        kCVImageBufferYCbCrMatrixKey,
+    },
+    metal_texture::{CVMetalTexture, CVMetalTextureGetTexture},
+    metal_texture_cache::CVMetalTextureCache,
+    pixel_buffer::{
+        CVPixelBuffer, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+    },
 };
 use foreign_types::ForeignType;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -139,6 +150,14 @@ pub struct MetalRenderer {
     sprite_atlas: Arc<MetalAtlas>,
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     core_video_texture_cache: core_video::metal_texture_cache::CVMetalTextureCache,
+    /// The textures the frame being encoded samples. CoreVideo may hand a texture's backing
+    /// buffer to a new picture once the `CVMetalTexture` is released, so they ride to the command
+    /// buffer's completion handler instead of dying with the draw call.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    surface_textures: Vec<CVMetalTexture>,
+    /// A surface was skipped and said so; later ones stay quiet.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    surface_skip_logged: bool,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -371,6 +390,10 @@ impl MetalRenderer {
             sprite_atlas,
             #[cfg(any(target_os = "macos", target_os = "ios"))]
             core_video_texture_cache,
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            surface_textures: Vec::new(),
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            surface_skip_logged: false,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -523,13 +546,20 @@ impl MetalRenderer {
                 scene.surfaces.len(),
             )
         })?;
+        // Housekeeping CoreVideo asks for periodically: textures no command buffer holds any
+        // more give their buffers back.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        self.core_video_texture_cache.flush(0);
         let command_buffer = self.draw_primitives_to_texture(
             scene,
             &instance_bindings,
             &mut writer,
             texture,
             viewport_size,
-        )?;
+        );
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let surface_textures = Cell::new(mem::take(&mut self.surface_textures));
+        let command_buffer = command_buffer?;
 
         let instance_buffer_pool = self.instance_buffer_pool.clone();
         let instance_buffer = Cell::new(Some(writer.finish()));
@@ -537,6 +567,9 @@ impl MetalRenderer {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
             }
+            // The GPU is done sampling this frame's surfaces.
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            drop(surface_textures.take());
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
         unsafe {
@@ -1181,40 +1214,47 @@ impl MetalRenderer {
                 DevicePixels::from(surface.image_buffer.get_height() as i32),
             );
 
-            assert_eq!(
-                surface.image_buffer.get_pixel_format(),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
+            let format = surface.image_buffer.get_pixel_format();
+            let full_range = if format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
+                true
+            } else if format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
+                false
+            } else {
+                self.skip_surface(format_args!(
+                    "pixel format {format:#x} is not 4:2:0 bi-planar"
+                ));
+                continue;
+            };
+            let ycbcr_to_rgb = ycbcr_to_rgb(surface_matrix(&surface.image_buffer), full_range);
 
-            let y_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
+            let plane = |plane: usize, format: MTLPixelFormat| {
+                self.core_video_texture_cache.create_texture_from_image(
                     surface.image_buffer.as_concrete_TypeRef(),
                     None,
-                    MTLPixelFormat::R8Unorm,
-                    surface.image_buffer.get_width_of_plane(0),
-                    surface.image_buffer.get_height_of_plane(0),
-                    0,
+                    format,
+                    surface.image_buffer.get_width_of_plane(plane),
+                    surface.image_buffer.get_height_of_plane(plane),
+                    plane,
                 )
-                .unwrap();
-            let cb_cr_texture = self
-                .core_video_texture_cache
-                .create_texture_from_image(
-                    surface.image_buffer.as_concrete_TypeRef(),
-                    None,
-                    MTLPixelFormat::RG8Unorm,
-                    surface.image_buffer.get_width_of_plane(1),
-                    surface.image_buffer.get_height_of_plane(1),
-                    1,
-                )
-                .unwrap();
+            };
+            let (y_texture, cb_cr_texture) = match (
+                plane(0, MTLPixelFormat::R8Unorm),
+                plane(1, MTLPixelFormat::RG8Unorm),
+            ) {
+                (Ok(y), Ok(cb_cr)) => (y, cb_cr),
+                (Err(status), _) | (_, Err(status)) => {
+                    self.skip_surface(format_args!(
+                        "CVMetalTextureCacheCreateTextureFromImage failed: {status}"
+                    ));
+                    continue;
+                }
+            };
 
             command_encoder.set_vertex_bytes(
                 SurfaceInputIndex::TextureSize as u64,
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
-            // let y_texture = y_texture.get_texture().unwrap().
             command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
                 let texture = CVMetalTextureGetTexture(y_texture.as_concrete_TypeRef());
                 Some(metal::TextureRef::from_ptr(texture as *mut _))
@@ -1223,6 +1263,13 @@ impl MetalRenderer {
                 let texture = CVMetalTextureGetTexture(cb_cr_texture.as_concrete_TypeRef());
                 Some(metal::TextureRef::from_ptr(texture as *mut _))
             });
+            command_encoder.set_fragment_bytes(
+                SurfaceInputIndex::YCbCrToRgb as u64,
+                mem::size_of_val(&ycbcr_to_rgb) as u64,
+                ycbcr_to_rgb.as_ptr() as *const _,
+            );
+            self.surface_textures.push(y_texture);
+            self.surface_textures.push(cb_cr_texture);
 
             command_encoder.draw_primitives_instanced_base_instance(
                 metal::MTLPrimitiveType::Triangle,
@@ -1232,6 +1279,218 @@ impl MetalRenderer {
                 (first_surface + index) as u64,
             );
         }
+    }
+
+    /// Leave a surface out of this frame rather than abort the app over it, and say why once.
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    fn skip_surface(&mut self, why: std::fmt::Arguments<'_>) {
+        if !self.surface_skip_logged {
+            self.surface_skip_logged = true;
+            log::error!("skipping a video surface: {why}");
+        }
+    }
+}
+
+/// The Y′CbCr matrix a surface's buffer is tagged with. Untagged is BT.709, the HD default.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn surface_matrix(buffer: &CVPixelBuffer) -> YCbCrMatrix {
+    // SAFETY: the keys and values are CoreVideo's own constant strings, which live forever.
+    let tagged = |key| unsafe { CFString::wrap_under_get_rule(key) };
+    let Some(matrix) = buffer
+        .as_buffer()
+        .get_attachment(&tagged(unsafe { kCVImageBufferYCbCrMatrixKey }), None)
+        .and_then(|value| value.downcast::<CFString>())
+    else {
+        return YCbCrMatrix::Bt709;
+    };
+    if matrix == tagged(unsafe { kCVImageBufferYCbCrMatrix_ITU_R_601_4 }) {
+        YCbCrMatrix::Bt601
+    } else if matrix == tagged(unsafe { kCVImageBufferYCbCrMatrix_ITU_R_2020 }) {
+        YCbCrMatrix::Bt2020
+    } else {
+        YCbCrMatrix::Bt709
+    }
+}
+
+/// The Y′CbCr → R′G′B′ matrices a surface may be tagged with.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum YCbCrMatrix {
+    Bt601,
+    Bt709,
+    Bt2020,
+}
+
+/// The `float4x4` (columns, as Metal lays it out) the surface shader multiplies
+/// `(y, cb, cr, 1)` by, for `matrix` at full or video range.
+fn ycbcr_to_rgb(matrix: YCbCrMatrix, full_range: bool) -> [[f32; 4]; 4] {
+    let (kr, kb) = match matrix {
+        YCbCrMatrix::Bt601 => (0.299, 0.114),
+        YCbCrMatrix::Bt709 => (0.2126, 0.0722),
+        YCbCrMatrix::Bt2020 => (0.2627, 0.0593),
+    };
+    let kg = 1.0 - kr - kb;
+    // Full range spans the whole code range; video range puts black at 16 and white at 235,
+    // chroma between 16 and 240. Chroma is centred on 128 either way.
+    let (y_offset, y_scale, c_scale) = if full_range {
+        (0.0, 1.0, 1.0)
+    } else {
+        (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0)
+    };
+    let c_offset = 128.0 / 255.0;
+    let r_cr = 2.0 * (1.0 - kr) * c_scale;
+    let g_cb = 2.0 * kb * (1.0 - kb) / kg * c_scale;
+    let g_cr = 2.0 * kr * (1.0 - kr) / kg * c_scale;
+    let b_cb = 2.0 * (1.0 - kb) * c_scale;
+    let y0 = -y_offset * y_scale;
+    [
+        [y_scale, y_scale, y_scale, 0.0],
+        [0.0, -g_cb, b_cb, 0.0],
+        [r_cr, -g_cr, 0.0, 0.0],
+        [
+            y0 - r_cr * c_offset,
+            y0 + (g_cb + g_cr) * c_offset,
+            y0 - b_cb * c_offset,
+            1.0,
+        ],
+    ]
+}
+
+#[cfg(test)]
+mod ycbcr_tests {
+    use super::{MetalRenderer, YCbCrMatrix, ycbcr_to_rgb};
+
+    fn rgb(m: [[f32; 4]; 4], y: f32, cb: f32, cr: f32) -> [f32; 3] {
+        let v = [y, cb, cr, 1.0];
+        let mut out = [0.0; 3];
+        for (row, value) in out.iter_mut().enumerate() {
+            *value = (0..4).map(|col| m[col][row] * v[col]).sum();
+        }
+        out
+    }
+
+    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(b).all(|(x, y)| (x - y).abs() < 2e-3)
+    }
+
+    /// Black, white and the primaries come out where BT.709 puts them, at both ranges; the
+    /// BT.601 matrix is the one the shader hard-coded before.
+    #[test]
+    fn the_matrices_map_codes_to_the_right_colours() {
+        let c = 128.0 / 255.0;
+        let full = ycbcr_to_rgb(YCbCrMatrix::Bt709, true);
+        assert!(close(rgb(full, 0.0, c, c), [0.0; 3]));
+        assert!(close(rgb(full, 1.0, c, c), [1.0; 3]));
+        // Pure red in BT.709: Y = Kr, Cb = −Kr / (2 (1 − Kb)), Cr = 1/2.
+        let red = rgb(full, 0.2126, c - 0.2126 / (2.0 * (1.0 - 0.0722)), c + 0.5);
+        assert!(close(red, [1.0, 0.0, 0.0]), "{red:?}");
+
+        let video = ycbcr_to_rgb(YCbCrMatrix::Bt709, false);
+        assert!(close(rgb(video, 16.0 / 255.0, c, c), [0.0; 3]));
+        assert!(close(rgb(video, 235.0 / 255.0, c, c), [1.0; 3]));
+
+        let bt601 = ycbcr_to_rgb(YCbCrMatrix::Bt601, true);
+        let old = [
+            [1.0, 1.0, 1.0, 0.0],
+            [0.0, -0.3441, 1.7720, 0.0],
+            [1.4020, -0.7141, 0.0, 0.0],
+        ];
+        for (column, want) in bt601.iter().zip(old) {
+            assert!(
+                column.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-3),
+                "{bt601:?}"
+            );
+        }
+        assert_ne!(ycbcr_to_rgb(YCbCrMatrix::Bt2020, true), full);
+    }
+
+    /// A full-range BT.709 red surface renders red through the real pipeline, frame after
+    /// frame, with its textures held to each command buffer's completion; a surface in a
+    /// format the shader cannot sample is left out instead of aborting the renderer.
+    #[test]
+    fn a_tagged_surface_renders_its_colour_and_a_foreign_one_is_skipped() {
+        use core_foundation::{base::TCFType, dictionary::CFDictionary, string::CFString};
+        use core_video::{
+            buffer::{TCVBuffer, kCVAttachmentMode_ShouldPropagate},
+            image_buffer::{kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrixKey},
+            pixel_buffer::{
+                CVPixelBuffer, CVPixelBufferGetBaseAddressOfPlane,
+                CVPixelBufferGetBytesPerRowOfPlane, kCVPixelBufferIOSurfacePropertiesKey,
+                kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            },
+        };
+        use gpui::{Bounds, ContentMask, DevicePixels, PaintSurface, Scene, point, px, size};
+
+        let side = 32_usize;
+        let surface = |format: u32| {
+            let key =
+                unsafe { CFString::wrap_under_get_rule(kCVPixelBufferIOSurfacePropertiesKey) };
+            let empty = CFDictionary::<CFString, CFString>::from_CFType_pairs(&[]);
+            let options = CFDictionary::from_CFType_pairs(&[(key, empty.as_CFType())]);
+            CVPixelBuffer::new(format, side, side, Some(&options)).unwrap()
+        };
+        let red = surface(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
+        assert_eq!(red.lock_base_address(0), 0);
+        // BT.709 full-range red: Y = 0.2126, Cb = 0.5 − 0.2126 / 1.8556, Cr = 1.
+        for (plane, value) in [(0, [54_u8, 54]), (1, [99_u8, 255])] {
+            let base =
+                unsafe { CVPixelBufferGetBaseAddressOfPlane(red.as_concrete_TypeRef(), plane) };
+            let stride =
+                unsafe { CVPixelBufferGetBytesPerRowOfPlane(red.as_concrete_TypeRef(), plane) };
+            let rows = if plane == 0 { side } else { side / 2 };
+            let bytes = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), stride * rows) };
+            for row in bytes.chunks_exact_mut(stride) {
+                for pair in row[..side].chunks_exact_mut(2) {
+                    pair.copy_from_slice(&value);
+                }
+            }
+        }
+        assert_eq!(red.unlock_base_address(0), 0);
+        let tag = |key| unsafe { CFString::wrap_under_get_rule(key) };
+        red.as_buffer().set_attachment(
+            &tag(unsafe { kCVImageBufferYCbCrMatrixKey }),
+            &tag(unsafe { kCVImageBufferYCbCrMatrix_ITU_R_709_2 }).as_CFType(),
+            kCVAttachmentMode_ShouldPropagate,
+        );
+
+        let bounds = Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(side as f32), px(side as f32)),
+        )
+        .scale(1.0);
+        let scene_of = |image_buffer: CVPixelBuffer| {
+            let mut scene = Scene::default();
+            scene.insert_primitive(PaintSurface {
+                order: 0,
+                bounds,
+                content_mask: ContentMask { bounds },
+                image_buffer,
+            });
+            scene.finish();
+            scene
+        };
+        let mut renderer = MetalRenderer::new_headless(Default::default());
+        let target = size(DevicePixels(side as i32), DevicePixels(side as i32));
+        for _ in 0..3 {
+            let image = renderer
+                .render_scene_to_image(&scene_of(red.clone()), target)
+                .unwrap();
+            let [r, g, b, _] = image.get_pixel(16, 16).0;
+            assert!(
+                r >= 250 && g <= 5 && b <= 5,
+                "BT.709 red came out {r} {g} {b}"
+            );
+        }
+
+        let foreign = surface(kCVPixelFormatType_32BGRA);
+        let image = renderer
+            .render_scene_to_image(&scene_of(foreign), target)
+            .unwrap();
+        assert_eq!(
+            image.get_pixel(16, 16).0[..3],
+            [0, 0, 0],
+            "skipped, the clear colour shows"
+        );
+        assert!(renderer.surface_skip_logged);
     }
 }
 
@@ -1606,6 +1865,7 @@ pub enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+    YCbCrToRgb = 6,
 }
 
 #[repr(C)]
