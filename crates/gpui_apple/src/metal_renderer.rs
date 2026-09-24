@@ -1,4 +1,4 @@
-use crate::metal_atlas::MetalAtlas;
+use crate::{metal_atlas::MetalAtlas, presentation_pacing::PresentationPacer};
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
@@ -135,6 +135,9 @@ impl InstanceBufferPool {
     }
 }
 
+/// Until the platform names the display's refresh, assume the fastest Apple panel's.
+const DEFAULT_REFRESH: Duration = Duration::from_micros(8_333);
+
 pub struct MetalRenderer {
     device: metal::Device,
     layer: Option<metal::MetalLayer>,
@@ -143,6 +146,10 @@ pub struct MetalRenderer {
     presents_with_transaction: bool,
     /// Receives each drawn frame once the display has shown it; see [`Self::draw`].
     presented_frame_sink: Option<PresentedFrameSink>,
+    /// Frames the display has shown or dropped since [`Self::ready_for_vsync_frame`] last
+    /// looked, filled from a Metal thread.
+    presentations: Arc<Mutex<Vec<PresentedFrame>>>,
+    pacer: PresentationPacer,
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
@@ -178,18 +185,27 @@ pub struct MetalRenderer {
     headless_render_target: Option<metal::Texture>,
 }
 
-/// Hands `sink` the frame in `drawable` once the display shows it, or learns it was dropped.
-/// Must run before the drawable is presented, as `addPresentedHandler:` requires.
-fn report_presentation(drawable: &metal::MetalDrawableRef, sink: PresentedFrameSink) {
+/// Records the frame in `drawable` for the pacer, and hands it to `sink`, once the display
+/// shows it or learns it was dropped. Must run before the drawable is presented, as
+/// `addPresentedHandler:` requires.
+fn observe_presentation(
+    drawable: &metal::MetalDrawableRef,
+    presentations: Arc<Mutex<Vec<PresentedFrame>>>,
+    sink: Option<PresentedFrameSink>,
+) {
     let submitted_at = Instant::now();
     let handler = RcBlock::new(move |drawable: ptr::NonNull<AnyObject>| {
         // SAFETY: `addPresentedHandler:` calls the block with the `id<MTLDrawable>` it was
         // added to, alive for the duration of the call.
         let drawable = unsafe { metal::DrawableRef::from_ptr(drawable.as_ptr().cast()) };
-        sink(PresentedFrame {
+        let frame = PresentedFrame {
             submitted_at,
             presented_at: host_time_to_instant(drawable.presented_time()),
-        });
+        };
+        presentations.lock().push(frame);
+        if let Some(sink) = &sink {
+            sink(frame);
+        }
     });
     // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI,
     // and `addPresentedHandler:` copies the block before this one is released.
@@ -425,6 +441,8 @@ impl MetalRenderer {
             layer,
             presents_with_transaction: false,
             presented_frame_sink: None,
+            presentations: Arc::default(),
+            pacer: PresentationPacer::new(DEFAULT_REFRESH),
             is_apple_gpu,
             is_unified_memory,
             opaque,
@@ -481,6 +499,26 @@ impl MetalRenderer {
     /// runs on a Metal thread.
     pub fn set_presented_frame_sink(&mut self, sink: Option<PresentedFrameSink>) {
         self.presented_frame_sink = sink;
+    }
+
+    /// The display's shortest refresh interval, which paces [`Self::ready_for_vsync_frame`].
+    pub fn set_refresh_interval(&mut self, refresh: Duration) {
+        self.pacer.set_refresh(refresh);
+    }
+
+    /// Whether a display-link tick should draw, or leave its demand to the next tick so the
+    /// frames already queued for the display can drain; see `presentation_pacing`.
+    pub fn ready_for_vsync_frame(&mut self) -> bool {
+        for frame in self.presentations.lock().drain(..) {
+            self.pacer.presented(frame);
+        }
+        self.pacer.should_draw(Instant::now())
+    }
+
+    /// Whether no frame began within the last refresh, so one drawn now, off the vsync
+    /// tick, cannot land in the same refresh as the previous one.
+    pub fn idle_for_a_refresh(&self) -> bool {
+        self.pacer.idle_for_a_refresh(Instant::now())
     }
 
     pub fn update_drawable_size(&mut self, size: Size<DevicePixels>) {
@@ -572,9 +610,12 @@ impl MetalRenderer {
             }
         };
 
-        if let Some(sink) = &self.presented_frame_sink {
-            report_presentation(drawable, sink.clone());
-        }
+        observe_presentation(
+            drawable,
+            self.presentations.clone(),
+            self.presented_frame_sink.clone(),
+        );
+        self.pacer.submitted(Instant::now());
         if self.presents_with_transaction {
             command_buffer.commit();
             command_buffer.wait_until_scheduled();
