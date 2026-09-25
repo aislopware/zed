@@ -12,6 +12,14 @@
 //!   local-echo guess) and a second one `FRAME_LATENCY_ECHO_US` later (3000 by default: the
 //!   remote echo arriving). `wake_to_glass` is the keystroke's frame, `echo_to_glass` is from the
 //!   keystroke to the glass of the frame holding the second notify.
+//! - `flood`: another thread notifies every `FRAME_LATENCY_FLOOD_US` (2000 by default), like
+//!   terminals streaming output, so the window draws every refresh; a keystroke's notify comes
+//!   every 60 ms or so at a phase that walks across the refresh. `wake_to_glass` is from that
+//!   notify to the glass of the first frame submitted after it, `wake_to_submit` to its
+//!   submission.
+//!
+//! `FRAME_LATENCY_SPIN_US` makes every render busy-wait that long first, which moves each
+//! frame's submission later in its refresh (to find where the compositor's deadline sits).
 //!
 //! `submit_to_glass` is from the frame's submission to the GPU to the instant it was shown,
 //! and `build` from the start of the view's render to that submission.
@@ -37,6 +45,8 @@ const WARMUP_FRAMES: usize = 60;
 const CONTINUOUS_FRAMES: usize = 900;
 const IDLE_SAMPLES: usize = 40;
 const IDLE_GAP: Duration = Duration::from_millis(250);
+const FLOOD_SAMPLES: usize = 200;
+const FLOOD_GAP: Duration = Duration::from_millis(60);
 
 #[derive(Clone, Copy, PartialEq)]
 enum Mode {
@@ -44,6 +54,7 @@ enum Mode {
     Heavy,
     Idle,
     Echo,
+    Flood,
 }
 
 #[derive(Default)]
@@ -59,12 +70,14 @@ struct Stats {
     /// `echo`: the keystroke the pending second notify belongs to, and that notify.
     echo: Option<(Instant, Instant)>,
     echo_to_glass: Vec<f64>,
+    wake_to_submit: Vec<f64>,
 }
 
 struct FrameLatency {
     mode: Mode,
     cells: usize,
     tick: u64,
+    spin: Duration,
     stats: Rc<RefCell<Stats>>,
     _presented: Subscription,
 }
@@ -82,14 +95,8 @@ impl FrameLatency {
             }
         });
         if matches!(mode, Mode::Idle | Mode::Echo) {
-            let echo_after = (mode == Mode::Echo).then(|| {
-                Duration::from_micros(
-                    std::env::var("FRAME_LATENCY_ECHO_US")
-                        .ok()
-                        .and_then(|us| us.parse().ok())
-                        .unwrap_or(3000),
-                )
-            });
+            let echo_after = (mode == Mode::Echo)
+                .then(|| Duration::from_micros(env_us("FRAME_LATENCY_ECHO_US", 3000)));
             // Wakes come from another thread at a phase that walks across the refresh, as
             // keystrokes do, rather than from a main-thread timer that may coalesce with vsync.
             let (wakes, mut woken) = futures::channel::mpsc::unbounded();
@@ -124,14 +131,56 @@ impl FrameLatency {
             })
             .detach();
         }
+        if mode == Mode::Flood {
+            let flood_every = Duration::from_micros(env_us("FRAME_LATENCY_FLOOD_US", 2000));
+            // Both streams come from threads so their notifies land at any phase of the
+            // refresh, as output from the network does.
+            let (wakes, mut woken) = futures::channel::mpsc::unbounded();
+            let flood = wakes.clone();
+            std::thread::spawn(move || {
+                while flood.unbounded_send(None).is_ok() {
+                    std::thread::sleep(flood_every);
+                }
+            });
+            std::thread::spawn(move || {
+                for step in 0u32.. {
+                    std::thread::sleep(
+                        FLOOD_GAP + Duration::from_micros(u64::from(step % 16) * 830),
+                    );
+                    if wakes.unbounded_send(Some(Instant::now())).is_err() {
+                        break;
+                    }
+                }
+            });
+            let stats = stats.clone();
+            cx.spawn(async move |this, cx| {
+                while let Some(key) = futures::StreamExt::next(&mut woken).await {
+                    if let Some(key) = key {
+                        stats.borrow_mut().wake.get_or_insert(key);
+                    }
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
         Self {
             mode,
             cells,
             tick: 0,
+            spin: Duration::from_micros(env_us("FRAME_LATENCY_SPIN_US", 0)),
             stats,
             _presented: presented,
         }
     }
+}
+
+fn env_us(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|us| us.parse().ok())
+        .unwrap_or(default)
 }
 
 /// Returns whether the run has all its samples.
@@ -175,6 +224,17 @@ fn record(stats: &mut Stats, mode: Mode, frame: PresentedFrame) -> bool {
             }
             stats.submit_to_glass.len() >= IDLE_SAMPLES
         }
+        Mode::Flood => {
+            stats.submit_to_glass.push(ms(frame.submitted_at));
+            stats.presented_at.push(presented_at);
+            if let Some(wake) = stats.wake.take_if(|wake| *wake <= frame.submitted_at) {
+                stats.wake_to_glass.push(ms(wake));
+                stats
+                    .wake_to_submit
+                    .push((frame.submitted_at - wake).as_secs_f64() * 1e3);
+            }
+            stats.wake_to_glass.len() >= FLOOD_SAMPLES
+        }
         Mode::Echo => {
             if let Some(wake) = stats.wake.take_if(|wake| *wake <= frame.submitted_at) {
                 stats.wake_to_glass.push(ms(wake));
@@ -207,13 +267,14 @@ fn report(mode: Mode, stats: &Stats) {
         Mode::Heavy => "heavy",
         Mode::Idle => "idle",
         Mode::Echo => "echo",
+        Mode::Flood => "flood",
     };
     let mut line = format!(
         "mode={name} frames={} dropped={}",
         stats.submit_to_glass.len(),
         stats.dropped
     );
-    if matches!(mode, Mode::Continuous | Mode::Heavy) {
+    if matches!(mode, Mode::Continuous | Mode::Heavy | Mode::Flood) {
         let mut gaps: Vec<f64> = stats
             .presented_at
             .windows(2)
@@ -225,14 +286,21 @@ fn report(mode: Mode, stats: &Stats) {
             .iter()
             .map(|gap| ((gap / refresh).round() as u64).saturating_sub(1))
             .sum();
-        line += &format!(" refresh_ms={refresh:.2} missed={missed} ");
-        line += &summary("build", &stats.build);
+        line += &format!(" refresh_ms={refresh:.2} missed={missed}");
+        if !stats.build.is_empty() {
+            line += " ";
+            line += &summary("build", &stats.build);
+        }
     }
     line += " ";
     line += &summary("submit_to_glass", &stats.submit_to_glass);
-    if matches!(mode, Mode::Idle | Mode::Echo) {
+    if matches!(mode, Mode::Idle | Mode::Echo | Mode::Flood) {
         line += " ";
         line += &summary("wake_to_glass", &stats.wake_to_glass);
+    }
+    if mode == Mode::Flood {
+        line += " ";
+        line += &summary("wake_to_submit", &stats.wake_to_submit);
     }
     if mode == Mode::Echo {
         line += " ";
@@ -248,6 +316,10 @@ impl Render for FrameLatency {
             .borrow_mut()
             .render_started
             .push_back(Instant::now());
+        let started = Instant::now();
+        while started.elapsed() < self.spin {
+            std::hint::spin_loop();
+        }
         if matches!(self.mode, Mode::Continuous | Mode::Heavy) {
             window.request_animation_frame();
         }
@@ -289,8 +361,9 @@ fn main() {
         Some("heavy") => Mode::Heavy,
         Some("idle") => Mode::Idle,
         Some("echo") => Mode::Echo,
+        Some("flood") => Mode::Flood,
         Some(other) => {
-            eprintln!("unknown mode {other}; expected continuous, heavy, idle or echo");
+            eprintln!("unknown mode {other}; expected continuous, heavy, idle, echo or flood");
             std::process::exit(2);
         }
     };
@@ -299,7 +372,7 @@ fn main() {
             .ok()
             .and_then(|cells| cells.parse().ok())
             .unwrap_or(4000),
-        Mode::Continuous | Mode::Idle | Mode::Echo => 0,
+        Mode::Continuous | Mode::Idle | Mode::Echo | Mode::Flood => 0,
     };
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(700.)), cx);
