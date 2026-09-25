@@ -8,6 +8,10 @@
 //!   default), so each frame costs most of a refresh.
 //! - `idle`: a single frame after a quarter second of idle, like a keystroke in a quiet
 //!   terminal. `wake_to_glass` is from the notify to the glass.
+//! - `echo`: after a quarter second of idle, a notify (the keystroke, drawn at once like a
+//!   local-echo guess) and a second one `FRAME_LATENCY_ECHO_US` later (3000 by default: the
+//!   remote echo arriving). `wake_to_glass` is the keystroke's frame, `echo_to_glass` is from the
+//!   keystroke to the glass of the frame holding the second notify.
 //!
 //! `submit_to_glass` is from the frame's submission to the GPU to the instant it was shown,
 //! and `build` from the start of the view's render to that submission.
@@ -39,6 +43,7 @@ enum Mode {
     Continuous,
     Heavy,
     Idle,
+    Echo,
 }
 
 #[derive(Default)]
@@ -51,6 +56,9 @@ struct Stats {
     presented_at: Vec<Instant>,
     dropped: usize,
     wake: Option<Instant>,
+    /// `echo`: the keystroke the pending second notify belongs to, and that notify.
+    echo: Option<(Instant, Instant)>,
+    echo_to_glass: Vec<f64>,
 }
 
 struct FrameLatency {
@@ -73,7 +81,15 @@ impl FrameLatency {
                 }
             }
         });
-        if mode == Mode::Idle {
+        if matches!(mode, Mode::Idle | Mode::Echo) {
+            let echo_after = (mode == Mode::Echo).then(|| {
+                Duration::from_micros(
+                    std::env::var("FRAME_LATENCY_ECHO_US")
+                        .ok()
+                        .and_then(|us| us.parse().ok())
+                        .unwrap_or(3000),
+                )
+            });
             // Wakes come from another thread at a phase that walks across the refresh, as
             // keystrokes do, rather than from a main-thread timer that may coalesce with vsync.
             let (wakes, mut woken) = futures::channel::mpsc::unbounded();
@@ -82,15 +98,25 @@ impl FrameLatency {
                     std::thread::sleep(
                         IDLE_GAP + Duration::from_micros(u64::from(step % 16) * 830),
                     );
-                    if wakes.unbounded_send(Instant::now()).is_err() {
+                    let key = Instant::now();
+                    if wakes.unbounded_send((key, None)).is_err() {
                         break;
+                    }
+                    if let Some(after) = echo_after {
+                        std::thread::sleep(after);
+                        if wakes.unbounded_send((Instant::now(), Some(key))).is_err() {
+                            break;
+                        }
                     }
                 }
             });
             let stats = stats.clone();
             cx.spawn(async move |this, cx| {
-                while let Some(wake) = futures::StreamExt::next(&mut woken).await {
-                    stats.borrow_mut().wake = Some(wake);
+                while let Some((wake, key)) = futures::StreamExt::next(&mut woken).await {
+                    match key {
+                        None => stats.borrow_mut().wake = Some(wake),
+                        Some(key) => stats.borrow_mut().echo = Some((key, wake)),
+                    }
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
                         break;
                     }
@@ -118,7 +144,11 @@ fn record(stats: &mut Stats, mode: Mode, frame: PresentedFrame) -> bool {
     {
         render_started = Some(started);
     }
-    let warmup = if mode == Mode::Idle { 2 } else { WARMUP_FRAMES };
+    let warmup = if matches!(mode, Mode::Idle | Mode::Echo) {
+        2
+    } else {
+        WARMUP_FRAMES
+    };
     if stats.seen <= warmup {
         return false;
     }
@@ -145,6 +175,16 @@ fn record(stats: &mut Stats, mode: Mode, frame: PresentedFrame) -> bool {
             }
             stats.submit_to_glass.len() >= IDLE_SAMPLES
         }
+        Mode::Echo => {
+            if let Some(wake) = stats.wake.take_if(|wake| *wake <= frame.submitted_at) {
+                stats.wake_to_glass.push(ms(wake));
+            }
+            if let Some((key, _)) = stats.echo.take_if(|(_, echo)| *echo <= frame.submitted_at) {
+                stats.submit_to_glass.push(ms(frame.submitted_at));
+                stats.echo_to_glass.push(ms(key));
+            }
+            stats.echo_to_glass.len() >= IDLE_SAMPLES
+        }
     }
 }
 
@@ -166,13 +206,14 @@ fn report(mode: Mode, stats: &Stats) {
         Mode::Continuous => "continuous",
         Mode::Heavy => "heavy",
         Mode::Idle => "idle",
+        Mode::Echo => "echo",
     };
     let mut line = format!(
         "mode={name} frames={} dropped={}",
         stats.submit_to_glass.len(),
         stats.dropped
     );
-    if mode != Mode::Idle {
+    if matches!(mode, Mode::Continuous | Mode::Heavy) {
         let mut gaps: Vec<f64> = stats
             .presented_at
             .windows(2)
@@ -189,9 +230,13 @@ fn report(mode: Mode, stats: &Stats) {
     }
     line += " ";
     line += &summary("submit_to_glass", &stats.submit_to_glass);
-    if mode == Mode::Idle {
+    if matches!(mode, Mode::Idle | Mode::Echo) {
         line += " ";
         line += &summary("wake_to_glass", &stats.wake_to_glass);
+    }
+    if mode == Mode::Echo {
+        line += " ";
+        line += &summary("echo_to_glass", &stats.echo_to_glass);
     }
     println!("{line}");
 }
@@ -203,7 +248,7 @@ impl Render for FrameLatency {
             .borrow_mut()
             .render_started
             .push_back(Instant::now());
-        if self.mode != Mode::Idle {
+        if matches!(self.mode, Mode::Continuous | Mode::Heavy) {
             window.request_animation_frame();
         }
         let offset = px((self.tick % 400) as f32);
@@ -243,8 +288,9 @@ fn main() {
         None | Some("continuous") => Mode::Continuous,
         Some("heavy") => Mode::Heavy,
         Some("idle") => Mode::Idle,
+        Some("echo") => Mode::Echo,
         Some(other) => {
-            eprintln!("unknown mode {other}; expected continuous, heavy or idle");
+            eprintln!("unknown mode {other}; expected continuous, heavy, idle or echo");
             std::process::exit(2);
         }
     };
@@ -253,7 +299,7 @@ fn main() {
             .ok()
             .and_then(|cells| cells.parse().ok())
             .unwrap_or(4000),
-        Mode::Continuous | Mode::Idle => 0,
+        Mode::Continuous | Mode::Idle | Mode::Echo => 0,
     };
     application().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(900.), px(700.)), cx);

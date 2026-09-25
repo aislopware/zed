@@ -3391,7 +3391,13 @@ extern "C" fn immediate_frame(window_state: *mut c_void) {
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);
         callback(Default::default());
-        window_state.lock().request_frame_callback = Some(callback);
+        let mut lock = window_state.lock();
+        lock.request_frame_callback = Some(callback);
+        // A wake that only ran next-frame callbacks drew nothing, so it must not take the
+        // slot from the draw that follows it, such as a keystroke's echo a moment later.
+        if lock.renderer.idle_for_a_refresh() {
+            lock.immediate_frame_armed = true;
+        }
     }
 }
 
