@@ -748,6 +748,12 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Draws a ring outside this element's border, clear of it by the outline's offset.
+    fn outline(mut self, outline: crate::Outline) -> Self {
+        self.style().outline = Some(outline);
+        self
+    }
+
     /// Sets the grid columns of this element.
     fn grid_cols(mut self, cols: u16) -> Self {
         self.style().grid_cols = Some(GridTemplate {

@@ -291,6 +291,9 @@ pub struct Style {
     /// Box shadow of the element
     pub box_shadow: Vec<BoxShadow>,
 
+    /// A ring drawn outside the element's border, like CSS's `outline`
+    pub outline: Option<Outline>,
+
     /// The text style of this element
     #[refineable]
     pub text: TextStyleRefinement,
@@ -390,6 +393,21 @@ impl BoxShadow {
         self.inset = true;
         self
     }
+}
+
+/// The possible values of the outline property: a ring of `width` drawn `offset` outside the
+/// element's border, its corners following the element's radii grown by the same distance.
+///
+/// Unlike a spread [`BoxShadow`], the space between the element and the ring stays clear, so a
+/// focus ring can stand apart from an element without knowing the colour behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct Outline {
+    /// The ring's color.
+    pub color: Hsla,
+    /// The ring's thickness.
+    pub width: Pixels,
+    /// How far outside the element's border the ring starts.
+    pub offset: Pixels,
 }
 
 /// How to handle whitespace in text
@@ -755,6 +773,23 @@ impl Style {
             ));
         }
 
+        if let Some(outline) = self
+            .outline
+            .filter(|outline| !outline.color.is_transparent() && outline.width > Pixels::ZERO)
+        {
+            let reach = outline.offset + outline.width;
+            let mut background = outline.color;
+            background.a = 0.;
+            window.paint_quad(quad(
+                bounds.dilate(reach),
+                corner_radii.map(|radius| *radius + reach),
+                background,
+                outline.width,
+                outline.color,
+                BorderStyle::Solid,
+            ));
+        }
+
         #[cfg(debug_assertions)]
         if self.debug_below {
             cx.remove_global::<DebugBelow>();
@@ -806,6 +841,7 @@ impl Default for Style {
             border_style: BorderStyle::default(),
             corner_radii: Corners::default(),
             box_shadow: Default::default(),
+            outline: None,
             text: TextStyleRefinement::default(),
             mouse_cursor: None,
             opacity: None,

@@ -5608,6 +5608,55 @@ mod tests {
         assert_eq!(width, Some(f64::from(40. * scale)));
     }
 
+    struct Ringed;
+
+    impl Render for Ringed {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(
+                div()
+                    .absolute()
+                    .left(px(10.))
+                    .top(px(10.))
+                    .w(px(40.))
+                    .h(px(20.))
+                    .rounded(px(6.))
+                    .outline(crate::Outline {
+                        color: crate::red(),
+                        width: px(2.),
+                        offset: px(2.),
+                    }),
+            )
+        }
+    }
+
+    /// An outline is a ring of its width, its offset clear of the element, whose corners
+    /// follow the element's radii grown by the same distance; nothing is filled inside it.
+    #[test]
+    fn an_outline_rings_the_element_clear_of_its_edge() {
+        let mut cx = TestAppContext::single();
+        let window: AnyWindowHandle = cx.add_window(|_, _| Ringed).into();
+        let (quads, scale) = cx
+            .update_window(window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                (window.painted_quads(), window.scale_factor())
+            })
+            .unwrap();
+        let ring = quads
+            .iter()
+            .find(|quad| quad.border_color == crate::red())
+            .expect("the ring is painted");
+        let scaled = |value: f32| crate::ScaledPixels(value * scale);
+        assert_eq!(ring.bounds.origin.x, scaled(6.));
+        assert_eq!(ring.bounds.size.width, scaled(48.));
+        assert_eq!(ring.bounds.size.height, scaled(28.));
+        assert_eq!(ring.corner_radii.top_left, scaled(10.));
+        assert_eq!(ring.border_widths.top, scaled(2.));
+        assert!(
+            ring.background.solid.is_transparent(),
+            "only the ring is drawn"
+        );
+    }
+
     /// A field whose labelled node is its frame and whose focus handle sits on
     /// a role-less element inside it, as text inputs are often built.
     struct FramedField {
