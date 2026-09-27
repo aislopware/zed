@@ -2329,11 +2329,11 @@ impl Interactivity {
                     }
                 } else if focus_handle.is_focused(window) {
                     // Focusable, but with no element id it can't have an
-                    // accessibility node, so screen readers fall back to the
-                    // whole window.
+                    // accessibility node, so its nearest ancestor with one
+                    // stands for it.
                     window
                         .a11y
-                        .note_focus_without_node(focus_handle.id, "it has no element id");
+                        .focus_nearest_ancestor(focus_handle.id, "it has no element id");
                 }
             }
         }
@@ -5606,6 +5606,62 @@ mod tests {
         assert!(clickable);
         // Bounds are device pixels.
         assert_eq!(width, Some(f64::from(40. * scale)));
+    }
+
+    /// A field whose labelled node is its frame and whose focus handle sits on
+    /// a role-less element inside it, as text inputs are often built.
+    struct FramedField {
+        focus: FocusHandle,
+    }
+
+    impl Render for FramedField {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().id("root").size_full().child(
+                div()
+                    .id("frame")
+                    .role(accesskit::Role::TextInput)
+                    .aria_label("Name")
+                    .w(px(80.))
+                    .h(px(20.))
+                    .child(div().id("editor").track_focus(&self.focus).size_full()),
+            )
+        }
+    }
+
+    /// A focused element with no node of its own hands the focus to its nearest
+    /// ancestor that has one, pushed by that ancestor's prepaint before the
+    /// focused element's, so a screen reader announces the field, not the window.
+    #[test]
+    fn a_focused_element_without_a_role_focuses_its_labelled_ancestor() {
+        let mut cx = TestAppContext::single();
+        let focus = cx.update(|cx| cx.focus_handle());
+        let window: AnyWindowHandle = cx
+            .add_window({
+                let focus = focus.clone();
+                move |_, _| FramedField { focus }
+            })
+            .into();
+        cx.update_window(window, |_, window, cx| {
+            window.set_a11y_active(true);
+            window.focus(&focus, cx);
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        let focused = cx
+            .update_window(window, |_, window, _| {
+                let tree = window.a11y_tree().expect("a tree after an active frame");
+                let (_, node) = tree
+                    .nodes
+                    .iter()
+                    .find(|(id, _)| *id == tree.focus)
+                    .expect("the focused node is in the tree");
+                (node.role(), node.label().map(str::to_owned))
+            })
+            .unwrap();
+        assert_eq!(
+            focused,
+            (accesskit::Role::TextInput, Some("Name".to_owned()))
+        );
     }
 
     #[gpui::test]

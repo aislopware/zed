@@ -246,12 +246,31 @@ impl A11y {
             // later focus on a node-less element logs again.
             self.last_focus_without_node = None;
             self.nodes.set_focus(node_id);
-        } else {
+        } else if let Some(focus_id) = self.focus_ids.get(&node_id).copied() {
             // The element registered a focus handle and an id, but never got a
             // node because it has no role.
-            if let Some(focus_id) = self.focus_ids.get(&node_id).copied() {
-                self.note_focus_without_node(focus_id, "it has an id but no role");
+            self.focus_nearest_ancestor(focus_id, "it has an id but no role");
+        }
+    }
+
+    /// Report the focused element's nearest ancestor that has a node as focused,
+    /// for a focused element that has none of its own.
+    ///
+    /// A widget often keeps its focus handle on an inner element while the
+    /// labelled node (a text input's frame, say) is an ancestor of it; that
+    /// ancestor is what assistive technology should announce. Called from the
+    /// focused element's own prepaint, so the node on top of the stack is the
+    /// nearest ancestor with a node. With none but the window's root, the whole
+    /// window is announced, and that is logged.
+    ///
+    /// Must only be called once per frame, like [`Self::set_focus`].
+    pub(crate) fn focus_nearest_ancestor(&mut self, focus_id: FocusId, reason: &str) {
+        match self.nodes.innermost() {
+            Some(ancestor) => {
+                self.last_focus_without_node = None;
+                self.nodes.set_focus(ancestor);
             }
+            None => self.note_focus_without_node(focus_id, reason),
         }
     }
 
@@ -505,6 +524,15 @@ impl A11yNodeBuilder {
     /// Returns whether a node with the given ID has been pushed in this frame.
     pub(crate) fn has_node(&self, id: NodeId) -> bool {
         id == ROOT_NODE_ID || self.seen_ids.contains(&id)
+    }
+
+    /// The node on top of the stack, the innermost one open, unless that is the
+    /// root.
+    fn innermost(&self) -> Option<NodeId> {
+        self.ids_stack
+            .last()
+            .copied()
+            .filter(|&id| id != ROOT_NODE_ID)
     }
 
     /// Returns whether `id` is the node currently reported as focused.
@@ -890,6 +918,24 @@ mod tests {
         a11y.nodes.pop(); // second
 
         a11y.nodes.pop(); // container
+    }
+
+    // A focused node-less element inside `frame` reports `frame` as focused;
+    // one with no node above it but the root leaves the focus on the window.
+    #[test]
+    fn a_node_less_focus_falls_back_to_the_nearest_ancestor() {
+        let mut a11y = new_a11y();
+        let (frame, editor) = (NodeId(1), NodeId(2));
+        assert!(a11y.nodes.push(frame, test_node()));
+        a11y.set_focusable(editor, FocusId::default());
+        a11y.set_focus(editor);
+        a11y.nodes.pop(); // frame
+        assert_eq!(a11y.end_frame(Default::default()).focus, frame);
+
+        a11y.begin_frame();
+        a11y.set_focusable(editor, FocusId::default());
+        a11y.set_focus(editor);
+        assert_eq!(a11y.end_frame(Default::default()).focus, ROOT_NODE_ID);
     }
 
     // Node A is focused; node C (a child of the unfocused node B) claims the
