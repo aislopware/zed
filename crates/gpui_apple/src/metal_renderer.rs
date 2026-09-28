@@ -26,6 +26,12 @@ use core_video::{
     pixel_buffer::{
         CVPixelBuffer, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
         kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        kCVPixelFormatType_420YpCbCr10BiPlanarFullRange,
+        kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange,
+        kCVPixelFormatType_422YpCbCr10BiPlanarFullRange,
+        kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange,
+        kCVPixelFormatType_444YpCbCr10BiPlanarFullRange,
+        kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
     },
 };
 use foreign_types::ForeignType;
@@ -1332,17 +1338,14 @@ impl MetalRenderer {
             );
 
             let format = surface.image_buffer.get_pixel_format();
-            let full_range = if format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange {
-                true
-            } else if format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange {
-                false
-            } else {
+            let Some(layout) = SurfaceLayout::of(format) else {
                 self.skip_surface(format_args!(
-                    "pixel format {format:#x} is not 4:2:0 bi-planar"
+                    "pixel format {format:#x} is not an 8- or 10-bit Y′CbCr bi-planar one"
                 ));
                 continue;
             };
-            let ycbcr_to_rgb = ycbcr_to_rgb(surface_matrix(&surface.image_buffer), full_range);
+            let ycbcr_to_rgb = ycbcr_to_rgb(surface_matrix(&surface.image_buffer), layout);
+            let (luma_format, chroma_format) = layout.depth.plane_formats();
 
             let plane = |plane: usize, format: MTLPixelFormat| {
                 self.core_video_texture_cache.create_texture_from_image(
@@ -1354,10 +1357,8 @@ impl MetalRenderer {
                     plane,
                 )
             };
-            let (y_texture, cb_cr_texture) = match (
-                plane(0, MTLPixelFormat::R8Unorm),
-                plane(1, MTLPixelFormat::RG8Unorm),
-            ) {
+            let (y_texture, cb_cr_texture) = match (plane(0, luma_format), plane(1, chroma_format))
+            {
                 (Ok(y), Ok(cb_cr)) => (y, cb_cr),
                 (Err(status), _) | (_, Err(status)) => {
                     self.skip_surface(format_args!(
@@ -1437,23 +1438,90 @@ enum YCbCrMatrix {
     Bt2020,
 }
 
+/// How a surface's two planes hold their samples, read off its pixel format. Chroma may be
+/// subsampled or not: the shader samples both planes at the same normalised coordinates, so
+/// 4:2:0, 4:2:2 and 4:4:4 differ only in the plane sizes CoreVideo reports.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SurfaceLayout {
+    depth: SampleDepth,
+    full_range: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SampleDepth {
+    Eight,
+    /// Ten significant bits at the top of each 16-bit sample.
+    Ten,
+}
+
+impl SurfaceLayout {
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    #[allow(non_upper_case_globals)]
+    fn of(format: u32) -> Option<Self> {
+        let (depth, full_range) = match format {
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange => (SampleDepth::Eight, false),
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange => (SampleDepth::Eight, true),
+            kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+            | kCVPixelFormatType_422YpCbCr10BiPlanarVideoRange
+            | kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange => (SampleDepth::Ten, false),
+            kCVPixelFormatType_420YpCbCr10BiPlanarFullRange
+            | kCVPixelFormatType_422YpCbCr10BiPlanarFullRange
+            | kCVPixelFormatType_444YpCbCr10BiPlanarFullRange => (SampleDepth::Ten, true),
+            _ => return None,
+        };
+        Some(Self { depth, full_range })
+    }
+}
+
+impl SampleDepth {
+    /// The luma and interleaved-chroma texture formats a plane of this depth is viewed as.
+    fn plane_formats(self) -> (MTLPixelFormat, MTLPixelFormat) {
+        match self {
+            Self::Eight => (MTLPixelFormat::R8Unorm, MTLPixelFormat::RG8Unorm),
+            Self::Ten => (MTLPixelFormat::R16Unorm, MTLPixelFormat::RG16Unorm),
+        }
+    }
+
+    fn bits(self) -> i32 {
+        match self {
+            Self::Eight => 8,
+            Self::Ten => 10,
+        }
+    }
+
+    /// What a unorm texture reads for `code` at this depth.
+    fn sampled(self, code: f32) -> f32 {
+        match self {
+            Self::Eight => code / 255.0,
+            Self::Ten => code * 64.0 / 65535.0,
+        }
+    }
+}
+
 /// The `float4x4` (columns, as Metal lays it out) the surface shader multiplies
-/// `(y, cb, cr, 1)` by, for `matrix` at full or video range.
-fn ycbcr_to_rgb(matrix: YCbCrMatrix, full_range: bool) -> [[f32; 4]; 4] {
+/// `(y, cb, cr, 1)` by, for `matrix` at the depth and range of `layout`.
+fn ycbcr_to_rgb(matrix: YCbCrMatrix, layout: SurfaceLayout) -> [[f32; 4]; 4] {
     let (kr, kb) = match matrix {
         YCbCrMatrix::Bt601 => (0.299, 0.114),
         YCbCrMatrix::Bt709 => (0.2126, 0.0722),
         YCbCrMatrix::Bt2020 => (0.2627, 0.0593),
     };
     let kg = 1.0 - kr - kb;
-    // Full range spans the whole code range; video range puts black at 16 and white at 235,
-    // chroma between 16 and 240. Chroma is centred on 128 either way.
-    let (y_offset, y_scale, c_scale) = if full_range {
-        (0.0, 1.0, 1.0)
+    let depth = layout.depth;
+    // Full range spans every code; video range puts black at 16 and white at 235, chroma
+    // between 16 and 240, each scaled by 4 at 10 bits (64, 940, 64 and 960). Chroma is centred
+    // on 128 (512) either way.
+    let step = 2f32.powi(depth.bits() - 8);
+    let max = 2f32.powi(depth.bits()) - 1.0;
+    let (y_black, y_span, c_span) = if layout.full_range {
+        (0.0, max, max)
     } else {
-        (16.0 / 255.0, 255.0 / 219.0, 255.0 / 224.0)
+        (16.0 * step, 219.0 * step, 224.0 * step)
     };
-    let c_offset = 128.0 / 255.0;
+    let y_offset = depth.sampled(y_black);
+    let y_scale = 1.0 / depth.sampled(y_span);
+    let c_scale = 1.0 / depth.sampled(c_span);
+    let c_offset = depth.sampled(128.0 * step);
     let r_cr = 2.0 * (1.0 - kr) * c_scale;
     let g_cb = 2.0 * kb * (1.0 - kb) / kg * c_scale;
     let g_cr = 2.0 * kr * (1.0 - kr) / kg * c_scale;
@@ -1474,7 +1542,40 @@ fn ycbcr_to_rgb(matrix: YCbCrMatrix, full_range: bool) -> [[f32; 4]; 4] {
 
 #[cfg(test)]
 mod ycbcr_tests {
-    use super::{MetalRenderer, YCbCrMatrix, ycbcr_to_rgb};
+    use super::{MetalRenderer, SampleDepth, SurfaceLayout, YCbCrMatrix, ycbcr_to_rgb};
+    use core_foundation::{base::TCFType, dictionary::CFDictionary, string::CFString};
+    use core_video::{
+        buffer::{TCVBuffer, kCVAttachmentMode_ShouldPropagate},
+        image_buffer::{kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrixKey},
+        pixel_buffer::{
+            CVPixelBuffer, CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
+            kCVPixelBufferIOSurfacePropertiesKey, kCVPixelFormatType_32BGRA,
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+            kCVPixelFormatType_444YpCbCr10BiPlanarFullRange,
+            kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
+        },
+    };
+    use gpui::{Bounds, ContentMask, DevicePixels, PaintSurface, Scene, point, px, size};
+    use image::RgbaImage;
+
+    const SIDE: usize = 32;
+    const EIGHT_FULL: SurfaceLayout = SurfaceLayout {
+        depth: SampleDepth::Eight,
+        full_range: true,
+    };
+    const EIGHT_VIDEO: SurfaceLayout = SurfaceLayout {
+        depth: SampleDepth::Eight,
+        full_range: false,
+    };
+    const TEN_FULL: SurfaceLayout = SurfaceLayout {
+        depth: SampleDepth::Ten,
+        full_range: true,
+    };
+    const TEN_VIDEO: SurfaceLayout = SurfaceLayout {
+        depth: SampleDepth::Ten,
+        full_range: false,
+    };
 
     fn rgb(m: [[f32; 4]; 4], y: f32, cb: f32, cr: f32) -> [f32; 3] {
         let v = [y, cb, cr, 1.0];
@@ -1489,23 +1590,90 @@ mod ycbcr_tests {
         a.iter().zip(b).all(|(x, y)| (x - y).abs() < 2e-3)
     }
 
+    /// What an R16Unorm texel reads for a 10-bit code held in the top bits.
+    fn ten(code: u16) -> f32 {
+        f32::from(code << 6) / 65535.0
+    }
+
+    /// An IOSurface-backed buffer, as a decoder hands over, tagged BT.709.
+    fn surface(format: u32) -> CVPixelBuffer {
+        // SAFETY: the key and values are CoreVideo's own constant strings, which live forever.
+        let tag = |key| unsafe { CFString::wrap_under_get_rule(key) };
+        let empty = CFDictionary::<CFString, CFString>::from_CFType_pairs(&[]);
+        let options = CFDictionary::from_CFType_pairs(&[(
+            tag(unsafe { kCVPixelBufferIOSurfacePropertiesKey }),
+            empty.as_CFType(),
+        )]);
+        let buffer = CVPixelBuffer::new(format, SIDE, SIDE, Some(&options)).unwrap();
+        buffer.as_buffer().set_attachment(
+            &tag(unsafe { kCVImageBufferYCbCrMatrixKey }),
+            &tag(unsafe { kCVImageBufferYCbCrMatrix_ITU_R_709_2 }).as_CFType(),
+            kCVAttachmentMode_ShouldPropagate,
+        );
+        buffer
+    }
+
+    /// Writes `texel(x)` to every texel of each row of `plane`, as samples of type `T`.
+    fn fill<T: Copy>(buffer: &CVPixelBuffer, plane: usize, texel: impl Fn(usize) -> Vec<T>) {
+        // SAFETY: the base address is locked, and a plane spans `bytes per row × height`.
+        let (base, stride) = unsafe {
+            (
+                CVPixelBufferGetBaseAddressOfPlane(buffer.as_concrete_TypeRef(), plane),
+                CVPixelBufferGetBytesPerRowOfPlane(buffer.as_concrete_TypeRef(), plane),
+            )
+        };
+        let row_len = stride / size_of::<T>();
+        let samples = unsafe {
+            std::slice::from_raw_parts_mut(
+                base.cast::<T>(),
+                row_len * buffer.get_height_of_plane(plane),
+            )
+        };
+        for row in samples.chunks_exact_mut(row_len) {
+            let mut at = 0;
+            for x in 0..buffer.get_width_of_plane(plane) {
+                let value = texel(x);
+                row[at..at + value.len()].copy_from_slice(&value);
+                at += value.len();
+            }
+        }
+    }
+
+    fn render(renderer: &mut MetalRenderer, image_buffer: CVPixelBuffer) -> RgbaImage {
+        let bounds = Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(SIDE as f32), px(SIDE as f32)),
+        )
+        .scale(1.0);
+        let mut scene = Scene::default();
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            image_buffer,
+        });
+        scene.finish();
+        let target = size(DevicePixels(SIDE as i32), DevicePixels(SIDE as i32));
+        renderer.render_scene_to_image(&scene, target).unwrap()
+    }
+
     /// Black, white and the primaries come out where BT.709 puts them, at both ranges; the
     /// BT.601 matrix is the one the shader hard-coded before.
     #[test]
     fn the_matrices_map_codes_to_the_right_colours() {
         let c = 128.0 / 255.0;
-        let full = ycbcr_to_rgb(YCbCrMatrix::Bt709, true);
+        let full = ycbcr_to_rgb(YCbCrMatrix::Bt709, EIGHT_FULL);
         assert!(close(rgb(full, 0.0, c, c), [0.0; 3]));
         assert!(close(rgb(full, 1.0, c, c), [1.0; 3]));
         // Pure red in BT.709: Y = Kr, Cb = −Kr / (2 (1 − Kb)), Cr = 1/2.
         let red = rgb(full, 0.2126, c - 0.2126 / (2.0 * (1.0 - 0.0722)), c + 0.5);
         assert!(close(red, [1.0, 0.0, 0.0]), "{red:?}");
 
-        let video = ycbcr_to_rgb(YCbCrMatrix::Bt709, false);
+        let video = ycbcr_to_rgb(YCbCrMatrix::Bt709, EIGHT_VIDEO);
         assert!(close(rgb(video, 16.0 / 255.0, c, c), [0.0; 3]));
         assert!(close(rgb(video, 235.0 / 255.0, c, c), [1.0; 3]));
 
-        let bt601 = ycbcr_to_rgb(YCbCrMatrix::Bt601, true);
+        let bt601 = ycbcr_to_rgb(YCbCrMatrix::Bt601, EIGHT_FULL);
         let old = [
             [1.0, 1.0, 1.0, 0.0],
             [0.0, -0.3441, 1.7720, 0.0],
@@ -1517,7 +1685,38 @@ mod ycbcr_tests {
                 "{bt601:?}"
             );
         }
-        assert_ne!(ycbcr_to_rgb(YCbCrMatrix::Bt2020, true), full);
+        assert_ne!(ycbcr_to_rgb(YCbCrMatrix::Bt2020, EIGHT_FULL), full);
+    }
+
+    /// 10-bit video range puts black at code 64, white at 940 and chroma's extremes at 64 and
+    /// 960; full range spans 0 to 1023. The codes sit in the top of 16-bit samples, so they
+    /// read differently from the 8-bit ones and need their own offsets.
+    #[test]
+    fn ten_bit_codes_map_to_the_right_colours() {
+        let video = ycbcr_to_rgb(YCbCrMatrix::Bt709, TEN_VIDEO);
+        let c = ten(512);
+        assert!(close(rgb(video, ten(64), c, c), [0.0; 3]));
+        assert!(close(rgb(video, ten(940), c, c), [1.0; 3]));
+        let red = rgb(video, ten(250), ten(409), ten(960));
+        assert!(close(red, [1.0, 0.0, 0.0]), "{red:?}");
+
+        let full = ycbcr_to_rgb(YCbCrMatrix::Bt709, TEN_FULL);
+        assert!(close(rgb(full, 0.0, c, c), [0.0; 3]));
+        assert!(close(rgb(full, ten(1023), c, c), [1.0; 3]));
+        assert_ne!(video, ycbcr_to_rgb(YCbCrMatrix::Bt709, EIGHT_VIDEO));
+    }
+
+    #[test]
+    fn a_pixel_format_picks_its_depth_and_range() {
+        for (format, layout) in [
+            (kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, EIGHT_VIDEO),
+            (kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, EIGHT_FULL),
+            (kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange, TEN_VIDEO),
+            (kCVPixelFormatType_444YpCbCr10BiPlanarFullRange, TEN_FULL),
+        ] {
+            assert_eq!(SurfaceLayout::of(format), Some(layout), "{format:#x}");
+        }
+        assert_eq!(SurfaceLayout::of(kCVPixelFormatType_32BGRA), None);
     }
 
     /// A full-range BT.709 red surface renders red through the real pipeline, frame after
@@ -1525,89 +1724,74 @@ mod ycbcr_tests {
     /// format the shader cannot sample is left out instead of aborting the renderer.
     #[test]
     fn a_tagged_surface_renders_its_colour_and_a_foreign_one_is_skipped() {
-        use core_foundation::{base::TCFType, dictionary::CFDictionary, string::CFString};
-        use core_video::{
-            buffer::{TCVBuffer, kCVAttachmentMode_ShouldPropagate},
-            image_buffer::{kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrixKey},
-            pixel_buffer::{
-                CVPixelBuffer, CVPixelBufferGetBaseAddressOfPlane,
-                CVPixelBufferGetBytesPerRowOfPlane, kCVPixelBufferIOSurfacePropertiesKey,
-                kCVPixelFormatType_32BGRA, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-            },
-        };
-        use gpui::{Bounds, ContentMask, DevicePixels, PaintSurface, Scene, point, px, size};
-
-        let side = 32_usize;
-        let surface = |format: u32| {
-            let key =
-                unsafe { CFString::wrap_under_get_rule(kCVPixelBufferIOSurfacePropertiesKey) };
-            let empty = CFDictionary::<CFString, CFString>::from_CFType_pairs(&[]);
-            let options = CFDictionary::from_CFType_pairs(&[(key, empty.as_CFType())]);
-            CVPixelBuffer::new(format, side, side, Some(&options)).unwrap()
-        };
         let red = surface(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange);
         assert_eq!(red.lock_base_address(0), 0);
         // BT.709 full-range red: Y = 0.2126, Cb = 0.5 − 0.2126 / 1.8556, Cr = 1.
-        for (plane, value) in [(0, [54_u8, 54]), (1, [99_u8, 255])] {
-            let base =
-                unsafe { CVPixelBufferGetBaseAddressOfPlane(red.as_concrete_TypeRef(), plane) };
-            let stride =
-                unsafe { CVPixelBufferGetBytesPerRowOfPlane(red.as_concrete_TypeRef(), plane) };
-            let rows = if plane == 0 { side } else { side / 2 };
-            let bytes = unsafe { std::slice::from_raw_parts_mut(base.cast::<u8>(), stride * rows) };
-            for row in bytes.chunks_exact_mut(stride) {
-                for pair in row[..side].chunks_exact_mut(2) {
-                    pair.copy_from_slice(&value);
-                }
-            }
-        }
+        fill::<u8>(&red, 0, |_| vec![54]);
+        fill::<u8>(&red, 1, |_| vec![99, 255]);
         assert_eq!(red.unlock_base_address(0), 0);
-        let tag = |key| unsafe { CFString::wrap_under_get_rule(key) };
-        red.as_buffer().set_attachment(
-            &tag(unsafe { kCVImageBufferYCbCrMatrixKey }),
-            &tag(unsafe { kCVImageBufferYCbCrMatrix_ITU_R_709_2 }).as_CFType(),
-            kCVAttachmentMode_ShouldPropagate,
-        );
 
-        let bounds = Bounds::new(
-            point(px(0.), px(0.)),
-            size(px(side as f32), px(side as f32)),
-        )
-        .scale(1.0);
-        let scene_of = |image_buffer: CVPixelBuffer| {
-            let mut scene = Scene::default();
-            scene.insert_primitive(PaintSurface {
-                order: 0,
-                bounds,
-                content_mask: ContentMask { bounds },
-                image_buffer,
-            });
-            scene.finish();
-            scene
-        };
         let mut renderer = MetalRenderer::new_headless(Default::default());
-        let target = size(DevicePixels(side as i32), DevicePixels(side as i32));
         for _ in 0..3 {
-            let image = renderer
-                .render_scene_to_image(&scene_of(red.clone()), target)
-                .unwrap();
-            let [r, g, b, _] = image.get_pixel(16, 16).0;
+            let [r, g, b, _] = render(&mut renderer, red.clone()).get_pixel(16, 16).0;
             assert!(
                 r >= 250 && g <= 5 && b <= 5,
                 "BT.709 red came out {r} {g} {b}"
             );
         }
 
-        let foreign = surface(kCVPixelFormatType_32BGRA);
-        let image = renderer
-            .render_scene_to_image(&scene_of(foreign), target)
-            .unwrap();
+        let image = render(&mut renderer, surface(kCVPixelFormatType_32BGRA));
         assert_eq!(
             image.get_pixel(16, 16).0[..3],
             [0, 0, 0],
             "skipped, the clear colour shows"
         );
         assert!(renderer.surface_skip_logged);
+    }
+
+    /// A 10-bit 4:4:4 surface, at video range and at full, renders columns that alternate red
+    /// and blue each keeping its colour: chroma is sampled at full resolution, and the 16-bit
+    /// planes are read with the 10-bit offsets.
+    #[test]
+    fn a_ten_bit_444_surface_keeps_every_column_its_colour() {
+        let mut renderer = MetalRenderer::new_headless(Default::default());
+        // BT.709 red and blue as 10-bit (Y, Cb, Cr) codes.
+        for (format, red, blue) in [
+            (
+                kCVPixelFormatType_444YpCbCr10BiPlanarVideoRange,
+                [250, 409, 960],
+                [127, 960, 471],
+            ),
+            (
+                kCVPixelFormatType_444YpCbCr10BiPlanarFullRange,
+                [217, 395, 1023],
+                [74, 1023, 465],
+            ),
+        ] {
+            let buffer = surface(format);
+            assert_eq!(
+                buffer.get_width_of_plane(1),
+                SIDE,
+                "4:4:4 chroma is full width"
+            );
+            let code = |x: usize| if x.is_multiple_of(2) { red } else { blue };
+            assert_eq!(buffer.lock_base_address(0), 0);
+            fill::<u16>(&buffer, 0, |x| vec![code(x)[0] << 6]);
+            fill::<u16>(&buffer, 1, |x| vec![code(x)[1] << 6, code(x)[2] << 6]);
+            assert_eq!(buffer.unlock_base_address(0), 0);
+
+            let image = render(&mut renderer, buffer);
+            for x in 0..SIDE as u32 {
+                let [r, g, b, _] = image.get_pixel(x, 16).0;
+                let want_red = x.is_multiple_of(2);
+                let (hi, lo) = if want_red { (r, b) } else { (b, r) };
+                assert!(
+                    hi >= 250 && g <= 5 && lo <= 5,
+                    "{format:#x} column {x} came out {r} {g} {b}"
+                );
+            }
+        }
+        assert!(!renderer.surface_skip_logged);
     }
 }
 

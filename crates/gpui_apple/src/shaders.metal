@@ -882,7 +882,7 @@ vertex SurfaceVertexOutput surface_vertex(
 }
 
 // The matrix comes from the renderer, read off the surface: the buffer's Y′CbCr matrix tag
-// at the range its pixel format says (`ycbcr_to_rgb` in metal_renderer.rs).
+// at the depth and range its pixel format says (`ycbcr_to_rgb` in metal_renderer.rs).
 fragment float4 surface_fragment(SurfaceFragmentInput input [[stage_in]],
                                  texture2d<float> y_texture
                                  [[texture(SurfaceInputIndex_YTexture)]],
