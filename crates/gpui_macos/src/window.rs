@@ -836,10 +836,11 @@ impl MacWindowState {
     fn start_display_link(&mut self) {
         self.stop_display_link();
         unsafe {
-            if !self
-                .native_window
-                .occlusionState()
-                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+            if !FRAMES_WHILE_HIDDEN
+                && !self
+                    .native_window
+                    .occlusionState()
+                    .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
             {
                 return;
             }
@@ -3033,6 +3034,11 @@ fn report_visibility(window_state: &Arc<Mutex<MacWindowState>>) {
         .detach();
 }
 
+/// Whether a covered window keeps drawing. A test driving a real window waits on its frames,
+/// and the window may be covered by whatever the person at the machine is doing, so test builds
+/// keep the display link running; everything else saves the energy.
+const FRAMES_WHILE_HIDDEN: bool = cfg!(feature = "test-support");
+
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
@@ -3044,7 +3050,7 @@ extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
         {
             lock.move_traffic_light();
             lock.start_display_link();
-        } else {
+        } else if !FRAMES_WHILE_HIDDEN {
             lock.stop_display_link();
         }
     }
